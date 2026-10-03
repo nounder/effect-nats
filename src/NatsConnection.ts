@@ -1,0 +1,1281 @@
+/**
+ * Native NATS client connection built on the `NatsProtocol` wire codec.
+ *
+ * One connection multiplexes publishes, subscriptions and requests. It
+ * reconnects across the configured (and server-advertised) servers,
+ * resubscribes, and replays publishes buffered while disconnected.
+ *
+ * Like `@effect/sql-pg`, the session drives a Node `Duplex` (`node:net`, or
+ * `node:tls`) directly and decodes frames synchronously as they arrive.
+ * `ws://` and `wss://` servers go through `effect/socket` WebSockets, adapted
+ * to the same `Duplex` interface.
+ */
+import * as Cause from "effect/Cause"
+import * as Context from "effect/Context"
+import * as Deferred from "effect/Deferred"
+import * as Duration from "effect/Duration"
+import * as Effect from "effect/Effect"
+import * as Exit from "effect/Exit"
+import * as Layer from "effect/Layer"
+import * as Option from "effect/Option"
+import * as PubSub from "effect/PubSub"
+import * as Queue from "effect/Queue"
+import * as Redacted from "effect/Redacted"
+import type * as Scope from "effect/Scope"
+import * as Socket from "effect/socket/Socket"
+import * as Stream from "effect/Stream"
+import * as NNet from "node:net"
+import type * as NStream from "node:stream"
+import * as NTls from "node:tls"
+import * as NatsProtocol from "./internal/NatsProtocol.ts"
+import * as WebSocketDuplex from "./internal/WebSocketDuplex.ts"
+import {
+  NatsAuthorizationError,
+  NatsClosedError,
+  NatsConnectionError,
+  type NatsError,
+  NatsInvalidArgumentError,
+  NatsNoRespondersError,
+  NatsPermissionError,
+  NatsProtocolError,
+  NatsTimeoutError,
+} from "./NatsError.ts"
+import { NatsHeaders } from "./NatsHeaders.ts"
+import * as Nuid from "./Nuid.ts"
+
+const VERSION = "0.0.0"
+const DEFAULT_PORT = 4222
+
+export type Payload = string | Uint8Array
+
+export type ServerInfo = NatsProtocol.ServerInfo
+
+export interface TlsConfig extends NTls.ConnectionOptions {
+  /**
+   * Starts the TLS handshake before the server sends `INFO`. Requires the
+   * server to be configured with `handshake_first`.
+   */
+  readonly handshakeFirst?: boolean | undefined
+}
+
+export interface Config {
+  /**
+   * Server URLs like `nats://host:4222`, `tls://host:4222`, `host:4222`, or
+   * `ws://host:8080` / `wss://host` for the server's WebSocket listener.
+   * Credentials in the URL are used when `user`/`pass`/`token` are not set.
+   *
+   * WebSockets use the `Socket.WebSocketConstructor` service when provided,
+   * like `NodeSocket.layerWebSocketConstructor`, otherwise `globalThis.WebSocket`.
+   *
+   * @default "127.0.0.1:4222"
+   */
+  readonly servers?: string | ReadonlyArray<string> | undefined
+  readonly name?: string | undefined
+  readonly user?: string | undefined
+  readonly pass?: Redacted.Redacted | string | undefined
+  readonly token?: Redacted.Redacted | string | undefined
+  /** Do not deliver messages this connection published to its own subscriptions. */
+  readonly noEcho?: boolean | undefined
+  readonly pedantic?: boolean | undefined
+  /**
+   * `true` or options requires TLS. TLS is also used whenever the server
+   * requires it, with default options.
+   */
+  readonly tls?: boolean | TlsConfig | undefined
+  /** @default "20 seconds" */
+  readonly connectTimeout?: Duration.Input | undefined
+  /** @default "2 minutes" */
+  readonly pingInterval?: Duration.Input | undefined
+  /** Unanswered pings after which the connection is considered stale. @default 2 */
+  readonly maxPingOut?: number | undefined
+  /** @default true */
+  readonly reconnect?: boolean | undefined
+  /** Attempts per server, `-1` for unlimited. @default 10 */
+  readonly maxReconnectAttempts?: number | undefined
+  /** @default "2 seconds" */
+  readonly reconnectTimeWait?: Duration.Input | undefined
+  /** @default "100 millis" */
+  readonly reconnectJitter?: Duration.Input | undefined
+  /** @default "1 second" */
+  readonly reconnectJitterTls?: Duration.Input | undefined
+  /** Bytes of publishes buffered while disconnected. @default 8 MiB */
+  readonly reconnectBufferSize?: number | undefined
+  /** Keep `servers` order instead of shuffling. */
+  readonly noRandomize?: boolean | undefined
+  /** Ignore server URLs advertised by the cluster in `INFO`. */
+  readonly ignoreClusterUpdates?: boolean | undefined
+  /** @default "_INBOX" */
+  readonly inboxPrefix?: string | undefined
+  /** Opens a custom transport instead of `node:net`, like a Unix socket or proxy. */
+  readonly stream?: ((server: URL) => NStream.Duplex) | undefined
+}
+
+export interface PublishOptions {
+  readonly reply?: string | undefined
+  readonly headers?: NatsHeaders | undefined
+}
+
+export interface SubscribeOptions {
+  /** Queue group: each message is delivered to one member of the group. */
+  readonly queue?: string | undefined
+  /** Unsubscribe automatically after this many messages. */
+  readonly max?: number | undefined
+}
+
+export interface RequestOptions {
+  /** @default "1 second" */
+  readonly timeout?: Duration.Input | undefined
+  readonly headers?: NatsHeaders | undefined
+}
+
+export interface RequestManyOptions {
+  /** Upper bound on how long responses are collected. @default "1 second" */
+  readonly maxWait?: Duration.Input | undefined
+  /** Stop after this many responses. */
+  readonly maxMessages?: number | undefined
+  /** Stop when no response arrives within this time after the previous one. */
+  readonly stall?: Duration.Input | undefined
+  /** Stop at the first response with an empty payload and no headers. */
+  readonly sentinel?: boolean | undefined
+  readonly headers?: NatsHeaders | undefined
+}
+
+export interface Msg {
+  readonly subject: string
+  readonly sid: number
+  readonly reply: string | undefined
+  /**
+   * Payload bytes. A view into a pooled read buffer: copy it (`slice()`) when
+   * keeping it long-term, so the rest of the buffer can be collected.
+   */
+  readonly data: Uint8Array
+  readonly headers: NatsHeaders | undefined
+  readonly string: () => string
+  readonly json: <A = unknown>() => A
+  /**
+   * Publishes to the message's reply subject. Succeeds with `false` when the
+   * message has no reply subject.
+   */
+  readonly respond: (
+    payload?: Payload,
+    options?: { readonly headers?: NatsHeaders },
+  ) => Effect.Effect<boolean, NatsError>
+}
+
+export interface Subscription {
+  readonly sid: number
+  readonly subject: string
+  readonly queue: string | undefined
+  /**
+   * Messages delivered to this subscription. Ends when the subscription is
+   * unsubscribed, drained, reaches `max`, or the connection closes; fails if
+   * the server rejects it or the connection closes with an error.
+   * Meant for a single consumer.
+   */
+  readonly messages: Stream.Stream<Msg, NatsError>
+  /**
+   * Unsubscribes now or, with `max`, after that many messages in total.
+   */
+  readonly unsubscribe: (max?: number) => Effect.Effect<void>
+  /**
+   * Unsubscribes, waits until the server has stopped delivering, and ends
+   * `messages` after the already-received messages.
+   */
+  readonly drain: Effect.Effect<void, NatsError>
+}
+
+export type Status =
+  | { readonly _tag: "Disconnect"; readonly server: string; readonly error: NatsError | undefined }
+  | { readonly _tag: "Reconnecting"; readonly server: string }
+  | { readonly _tag: "Reconnect"; readonly server: string }
+  | { readonly _tag: "Error"; readonly error: NatsError }
+  | { readonly _tag: "StaleConnection"; readonly server: string }
+  | { readonly _tag: "LameDuckMode"; readonly server: string }
+  | {
+    readonly _tag: "ServersChanged"
+    readonly added: ReadonlyArray<string>
+  }
+  | { readonly _tag: "Close"; readonly error: NatsError | undefined }
+
+export interface Stats {
+  readonly inBytes: number
+  readonly outBytes: number
+  readonly inMsgs: number
+  readonly outMsgs: number
+}
+
+export interface NatsConnection {
+  /** `INFO` of the server currently (or last) connected to. */
+  readonly info: Effect.Effect<ServerInfo>
+  /** `host:port` of the server currently (or last) connected to. */
+  readonly server: Effect.Effect<string>
+  readonly publish: (subject: string, payload?: Payload, options?: PublishOptions) => Effect.Effect<void, NatsError>
+  readonly subscribe: (
+    subject: string,
+    options?: SubscribeOptions,
+  ) => Effect.Effect<Subscription, NatsError, Scope.Scope>
+  readonly request: (subject: string, payload?: Payload, options?: RequestOptions) => Effect.Effect<Msg, NatsError>
+  /**
+   * Publishes a request and streams every response until a `RequestManyOptions` limit is hit.
+   */
+  readonly requestMany: (
+    subject: string,
+    payload?: Payload,
+    options?: RequestManyOptions,
+  ) => Stream.Stream<Msg, NatsError>
+  /** Round trip to the server: everything published before has been processed. */
+  readonly flush: Effect.Effect<void, NatsError>
+  readonly rtt: Effect.Effect<Duration.Duration, NatsError>
+  /**
+   * Drains every subscription, flushes, and closes the connection.
+   */
+  readonly drain: Effect.Effect<void, NatsError>
+  readonly close: Effect.Effect<void>
+  /** Waits for the connection to close. Fails if it closed because of an error. */
+  readonly closed: Effect.Effect<void, NatsError>
+  readonly isClosed: Effect.Effect<boolean>
+  /** Drops the current connection and reconnects. */
+  readonly reconnect: Effect.Effect<void, NatsError>
+  /** Lifecycle events from the moment of subscription. Ends with `Close`. */
+  readonly status: Stream.Stream<Status>
+  readonly stats: Effect.Effect<Stats>
+}
+
+export const NatsConnection = Context.Service<NatsConnection>("effect-nats/NatsConnection")
+
+export const make = (config: Config = {}): Effect.Effect<NatsConnection, NatsError, Scope.Scope> =>
+  Effect.acquireRelease(
+    Effect.gen(function*() {
+      const context = yield* Effect.context<never>()
+      const runFork = Effect.runForkWith(context)
+      const webSocketConstructor = Option.getOrElse(
+        yield* Effect.serviceOption(Socket.WebSocketConstructor),
+        (): Socket.WebSocketConstructor["Service"] => (url, protocols) =>
+          new globalThis.WebSocket(url, protocols as string | Array<string> | undefined),
+      )
+      const resolved = yield* resolveConfig(config, (server, openTimeout) => {
+        const url = new URL(server)
+        // credentials travel in CONNECT, not in the HTTP upgrade
+        url.username = ""
+        url.password = ""
+        return WebSocketDuplex.make(
+          Socket.makeWebSocket(url.href, { openTimeout }).pipe(
+            Effect.provideService(Socket.WebSocketConstructor, webSocketConstructor),
+          ),
+          runFork,
+        )
+      })
+      const status = yield* PubSub.unbounded<Status>()
+      const session = yield* connectFirst(resolved)
+      return new NatsConnectionImpl(resolved, status, session)
+    }),
+    (connection) => Effect.sync(() => connection.closeWith(undefined)),
+  )
+
+export const layer = (config: Config = {}): Layer.Layer<NatsConnection, NatsError> =>
+  Layer.effect(NatsConnection, make(config))
+
+interface ServerEntry {
+  readonly url: URL
+  readonly hostport: string
+  readonly implicit: boolean
+  reconnects: number
+  lastAttempt: number
+}
+
+interface ResolvedConfig {
+  readonly servers: Array<ServerEntry>
+  readonly name: string | undefined
+  readonly user: string | undefined
+  readonly pass: Redacted.Redacted | undefined
+  readonly token: Redacted.Redacted | undefined
+  readonly echo: boolean
+  readonly pedantic: boolean
+  readonly tls: TlsConfig | undefined
+  readonly connectTimeout: number
+  readonly pingInterval: number
+  readonly maxPingOut: number
+  readonly reconnect: boolean
+  readonly maxReconnectAttempts: number
+  readonly reconnectTimeWait: number
+  readonly reconnectJitter: number
+  readonly reconnectJitterTls: number
+  readonly reconnectBufferSize: number
+  readonly ignoreClusterUpdates: boolean
+  readonly inboxPrefix: string
+  readonly stream: ((server: URL) => NStream.Duplex) | undefined
+  readonly openWebSocket: (server: URL, openTimeout: number) => NStream.Duplex
+}
+
+const toRedacted = (value: Redacted.Redacted | string | undefined): Redacted.Redacted | undefined =>
+  value === undefined ? undefined : Redacted.isRedacted(value) ? value : Redacted.make(value)
+
+const isWebSocket = (url: URL): boolean => url.protocol === "ws:" || url.protocol === "wss:"
+
+/**
+ * `protocol` applies to inputs without a scheme, like the `host:port` URLs a
+ * cluster advertises, which use the protocol of the current connection.
+ */
+const parseServer = (input: string, implicit: boolean, protocol = "nats:"): ServerEntry => {
+  const url = new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(input) ? input : `${protocol}//${input}`)
+  if (url.protocol !== "nats:" && url.protocol !== "tls:" && !isWebSocket(url)) {
+    throw new Error(`unsupported server protocol "${url.protocol}" in "${input}"`)
+  }
+  if (url.port === "" && !isWebSocket(url)) url.port = String(DEFAULT_PORT)
+  const port = url.port !== "" ? url.port : url.protocol === "wss:" ? "443" : "80"
+  return { url, hostport: `${url.hostname}:${port}`, implicit, reconnects: 0, lastAttempt: 0 }
+}
+
+const shuffle = <A>(items: Array<A>): Array<A> => {
+  for (let i = items.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1))
+    const item = items[i]
+    items[i] = items[j]
+    items[j] = item
+  }
+  return items
+}
+
+const resolveConfig = (
+  config: Config,
+  openWebSocket: (server: URL, openTimeout: number) => NStream.Duplex,
+): Effect.Effect<ResolvedConfig, NatsInvalidArgumentError> =>
+  Effect.try({
+    try: (): ResolvedConfig => {
+      const input = config.servers === undefined
+        ? ["127.0.0.1:4222"]
+        : typeof config.servers === "string"
+        ? [config.servers]
+        : [...config.servers]
+      if (input.length === 0) throw new Error("servers must not be empty")
+      const servers = input.map((server) => parseServer(server, false))
+      return {
+        servers: config.noRandomize ? servers : shuffle(servers),
+        name: config.name,
+        user: config.user,
+        pass: toRedacted(config.pass),
+        token: toRedacted(config.token),
+        echo: !config.noEcho,
+        pedantic: config.pedantic ?? false,
+        tls: config.tls === true ? {} : config.tls === false ? undefined : config.tls,
+        connectTimeout: Duration.toMillis(config.connectTimeout ?? "20 seconds"),
+        pingInterval: Duration.toMillis(config.pingInterval ?? "2 minutes"),
+        maxPingOut: config.maxPingOut ?? 2,
+        reconnect: config.reconnect ?? true,
+        maxReconnectAttempts: config.maxReconnectAttempts ?? 10,
+        reconnectTimeWait: Duration.toMillis(config.reconnectTimeWait ?? "2 seconds"),
+        reconnectJitter: Duration.toMillis(config.reconnectJitter ?? "100 millis"),
+        reconnectJitterTls: Duration.toMillis(config.reconnectJitterTls ?? "1 second"),
+        reconnectBufferSize: config.reconnectBufferSize ?? 8 * 1024 * 1024,
+        ignoreClusterUpdates: config.ignoreClusterUpdates ?? false,
+        inboxPrefix: config.inboxPrefix ?? "_INBOX",
+        stream: config.stream,
+        openWebSocket,
+      }
+    },
+    catch: (cause) => new NatsInvalidArgumentError({ message: `invalid config: ${(cause as Error).message}` }),
+  })
+
+const textEncoder = new TextEncoder()
+const textDecoder = new TextDecoder()
+const emptyBytes = new Uint8Array(0)
+
+const toBytes = (payload: Payload | undefined): Uint8Array =>
+  payload === undefined ? emptyBytes : typeof payload === "string" ? textEncoder.encode(payload) : payload
+
+const isAuthError = (message: string): boolean =>
+  /authorization violation|authentication|user .* expired/i.test(message)
+
+const serverError = (message: string): NatsError =>
+  isAuthError(message) ? new NatsAuthorizationError({ message }) : new NatsProtocolError({ message })
+
+const permissionPattern = /^permissions violation for (subscription|publish) to "(.+?)"(?: using queue "(.+?)")?/i
+
+interface Session {
+  readonly socket: NStream.Duplex
+  readonly parser: NatsProtocol.Parser
+  readonly info: ServerInfo
+  readonly server: ServerEntry
+  readonly tls: boolean
+  /** Messages decoded after the handshake `PONG` in the same chunk. */
+  readonly leftovers: Array<NatsProtocol.ServerMessage>
+}
+
+/**
+ * Opens a socket and runs the handshake: `INFO`, optional TLS upgrade,
+ * `CONNECT` + `PING`, and waits for `PONG`, which confirms authentication.
+ * Returns a function that aborts the attempt.
+ */
+const connectSession = (
+  config: ResolvedConfig,
+  server: ServerEntry,
+  onDone: (exit: Exit.Exit<Session, NatsError>) => void,
+): () => void => {
+  let done = false
+  let socket: NStream.Duplex | undefined
+  let info: ServerInfo | undefined
+  let tls = false
+  let phase: "info" | "tls" | "pong" | "ready" = "info"
+  const parser = NatsProtocol.makeParser()
+  const leftovers: Array<NatsProtocol.ServerMessage> = []
+  const host = server.url.hostname.replace(/^\[(.*)\]$/, "$1")
+  const webSocket = isWebSocket(server.url)
+  // `wss://` is encrypted by the WebSocket itself
+  const tlsOptions = webSocket ? undefined : config.tls ?? (server.url.protocol === "tls:" ? {} : undefined)
+
+  const finish = (exit: Exit.Exit<Session, NatsError>): void => {
+    if (done) return
+    done = true
+    clearTimeout(timer)
+    if (socket !== undefined) {
+      socket.off("data", onData)
+      socket.off("error", onError)
+      socket.off("close", onClose)
+      if (Exit.isFailure(exit)) socket.destroy()
+    }
+    onDone(exit)
+  }
+  const fail = (error: NatsError): void => finish(Exit.fail(error))
+  const failConnect = (message: string, cause?: unknown): void =>
+    fail(new NatsConnectionError({ message: `${server.hostport}: ${message}`, server: server.hostport, cause }))
+
+  const onError = (cause: Error) => failConnect(cause.message, cause)
+  const onClose = () => failConnect("connection closed during handshake")
+
+  const onData = (chunk: Uint8Array): void => {
+    try {
+      parser.pushEach(chunk, handle)
+    } catch (cause) {
+      return fail(new NatsProtocolError({ message: `${server.hostport}: ${(cause as Error).message}` }))
+    }
+    if (phase === "ready" && !done) {
+      finish(Exit.succeed({ socket: socket!, parser, info: info!, server, tls, leftovers }))
+    }
+  }
+
+  const upgrade = (raw: NStream.Duplex, then: () => void): void => {
+    phase = "tls"
+    raw.off("data", onData)
+    raw.off("error", onError)
+    raw.off("close", onClose)
+    const secure = NTls.connect({
+      ...tlsOptions,
+      socket: raw as NNet.Socket,
+      servername: tlsOptions?.servername ?? (NNet.isIP(host) === 0 ? host : undefined),
+    })
+    socket = secure
+    secure.on("error", onError)
+    secure.on("close", onClose)
+    secure.once("secureConnect", () => {
+      tls = true
+      secure.on("data", onData)
+      then()
+    })
+  }
+
+  const sendConnect = (): void => {
+    phase = "pong"
+    const user = config.user ?? (server.url.username !== "" ? decodeURIComponent(server.url.username) : undefined)
+    const urlPassword = server.url.password !== "" ? decodeURIComponent(server.url.password) : undefined
+    const pass = config.pass !== undefined ? Redacted.value(config.pass) : urlPassword
+    const token = config.token !== undefined
+      ? Redacted.value(config.token)
+      : user !== undefined && pass === undefined && config.user === undefined
+      ? user
+      : undefined
+    const headers = info!.headers === true
+    socket!.write(NatsProtocol.concatFrames([
+      NatsProtocol.encodeConnect({
+        verbose: false,
+        pedantic: config.pedantic,
+        tls_required: tls,
+        name: config.name,
+        lang: "effect-nats",
+        version: VERSION,
+        protocol: 1,
+        echo: config.echo,
+        headers,
+        no_responders: headers,
+        user: token === undefined ? user : undefined,
+        pass: token === undefined ? pass : undefined,
+        auth_token: token,
+      }),
+      NatsProtocol.PING_FRAME,
+    ]))
+  }
+
+  const handle = (message: NatsProtocol.ServerMessage): void => {
+    if (done) return
+    if (phase === "ready") {
+      leftovers.push(message)
+      return
+    }
+    switch (message._tag) {
+      case "Info": {
+        const first = info === undefined
+        info = message.info
+        if (!first) return
+        if (webSocket || (tlsOptions === undefined && !info.tls_required)) return sendConnect()
+        if (tls) return sendConnect()
+        if (!info.tls_required && !info.tls_available) return failConnect("server does not support TLS")
+        return upgrade(socket!, sendConnect)
+      }
+      case "Pong":
+        if (phase === "pong") phase = "ready"
+        return
+      case "Ping":
+        socket!.write(NatsProtocol.PONG_FRAME)
+        return
+      case "Err":
+        return fail(serverError(message.message))
+      case "Ok":
+        return
+      case "Msg":
+        leftovers.push(message)
+        return
+    }
+  }
+
+  const timer = setTimeout(() => failConnect("connection timed out"), config.connectTimeout)
+
+  const begin = (): void => {
+    if (tlsOptions?.handshakeFirst) upgrade(socket!, () => (phase = "info"))
+  }
+
+  try {
+    if (config.stream !== undefined) {
+      socket = config.stream(server.url)
+    } else if (webSocket) {
+      socket = config.openWebSocket(server.url, config.connectTimeout)
+    } else {
+      socket = NNet.connect({ host, port: Number(server.url.port), noDelay: true })
+    }
+  } catch (cause) {
+    failConnect("failed to open socket", cause)
+    return () => {}
+  }
+  socket.on("data", onData)
+  socket.on("error", onError)
+  socket.on("close", onClose)
+  if (config.stream !== undefined) begin()
+  else socket.once("connect", begin)
+
+  return () => {
+    if (done) return
+    done = true
+    clearTimeout(timer)
+    socket?.destroy()
+  }
+}
+
+const openSession = (config: ResolvedConfig, server: ServerEntry): Effect.Effect<Session, NatsError> =>
+  Effect.callback<Session, NatsError>((resume) => {
+    server.lastAttempt = Date.now()
+    const cancel = connectSession(config, server, (exit) => resume(exit))
+    return Effect.sync(cancel)
+  })
+
+/**
+ * Tries each server once, in order. An authorization error is reported as-is
+ * since another server of the same cluster would reject the credentials too.
+ */
+const connectFirst = (config: ResolvedConfig): Effect.Effect<Session, NatsError> =>
+  Effect.gen(function*() {
+    let lastError: NatsError | undefined
+    for (const server of config.servers) {
+      const exit = yield* Effect.exit(openSession(config, server))
+      if (Exit.isSuccess(exit)) return exit.value
+      const error = Cause.squash(exit.cause) as NatsError
+      if (error._tag === "NatsAuthorizationError") return yield* Effect.fail(error)
+      lastError = error
+    }
+    return yield* Effect.fail(
+      lastError ?? new NatsConnectionError({ message: "no servers to connect to" }),
+    )
+  })
+
+interface SubState {
+  readonly sid: number
+  readonly subject: string
+  readonly queue: string | undefined
+  max: number | undefined
+  received: number
+  readonly deliver: (msg: MsgImpl) => void
+  /** Ends delivery: with `undefined` the stream completes, otherwise fails. */
+  readonly end: (error: NatsError | undefined) => void
+}
+
+interface PendingRequest {
+  readonly subject: string
+  readonly deferred: Deferred.Deferred<Msg, NatsError>
+}
+
+type PongCallback = (error: NatsError | undefined) => void
+
+/** Write synchronously once this much is queued instead of waiting for the microtask. */
+const outboundFlushThreshold = 64 * 1024
+
+class MsgImpl implements Msg {
+  readonly #connection: NatsConnectionImpl
+  readonly #frame: NatsProtocol.Msg
+  #headers: NatsHeaders | undefined
+
+  constructor(connection: NatsConnectionImpl, frame: NatsProtocol.Msg) {
+    this.#connection = connection
+    this.#frame = frame
+  }
+
+  get subject() {
+    return this.#frame.subject
+  }
+
+  get sid() {
+    return this.#frame.sid
+  }
+
+  get reply() {
+    return this.#frame.reply
+  }
+
+  get data() {
+    return this.#frame.data
+  }
+
+  get headers(): NatsHeaders | undefined {
+    if (this.#headers === undefined && this.#frame.headers !== undefined) {
+      this.#headers = NatsHeaders.decode(this.#frame.headers)
+    }
+    return this.#headers
+  }
+
+  /** "No responders" status the server sends to a request nobody subscribes to. */
+  get isNoResponders(): boolean {
+    return this.#frame.headers !== undefined && this.#frame.data.length === 0 && this.headers!.code === 503
+  }
+
+  readonly string = (): string => textDecoder.decode(this.#frame.data)
+
+  readonly json = <A = unknown>(): A => JSON.parse(this.string())
+
+  readonly respond = (payload?: Payload, options?: { readonly headers?: NatsHeaders }) =>
+    this.#frame.reply === undefined || this.#frame.reply === ""
+      ? Effect.succeed(false)
+      : Effect.as(this.#connection.publish(this.#frame.reply, payload, options), true)
+}
+
+class NatsConnectionImpl implements NatsConnection {
+  readonly config: ResolvedConfig
+  readonly statusPubSub: PubSub.PubSub<Status>
+  readonly closedDeferred = Deferred.makeUnsafe<void, NatsError>()
+  servers: Array<ServerEntry>
+  session: Session | undefined
+  lastInfo: ServerInfo
+  lastServer: string
+  isDone = false
+  draining = false
+  lastError: NatsError | undefined
+
+  nextSid = 1
+  readonly subs = new Map<number, SubState>()
+
+  muxSub: SubState | undefined
+  muxPrefix = ""
+  readonly requests = new Map<string, PendingRequest>()
+
+  outbound: Array<Uint8Array> = []
+  outboundSize = 0
+  flushScheduled = false
+  /** Callbacks for `PING`s on the wire, oldest first. */
+  pongs: Array<PongCallback> = []
+  /** Flushes requested while disconnected, sent after reconnecting. */
+  pendingPongs: Array<PongCallback> = []
+  pingsOut = 0
+  pingTimer: ReturnType<typeof setInterval> | undefined
+  reconnectTimer: ReturnType<typeof setTimeout> | undefined
+  cancelConnect: (() => void) | undefined
+
+  inBytes = 0
+  outBytes = 0
+  inMsgs = 0
+  outMsgs = 0
+
+  constructor(config: ResolvedConfig, statusPubSub: PubSub.PubSub<Status>, session: Session) {
+    this.config = config
+    this.statusPubSub = statusPubSub
+    this.servers = [...config.servers]
+    this.lastInfo = session.info
+    this.lastServer = session.server.hostport
+    this.attach(session)
+  }
+
+  readonly info = Effect.sync(() => this.lastInfo)
+  readonly server = Effect.sync(() => this.lastServer)
+  readonly isClosed = Effect.sync(() => this.isDone)
+  readonly stats = Effect.sync((): Stats => ({
+    inBytes: this.inBytes,
+    outBytes: this.outBytes,
+    inMsgs: this.inMsgs,
+    outMsgs: this.outMsgs,
+  }))
+  readonly closed = Deferred.await(this.closedDeferred)
+
+  get status(): Stream.Stream<Status> {
+    return Stream.fromPubSub(this.statusPubSub).pipe(Stream.takeUntil((status) => status._tag === "Close"))
+  }
+
+  emit(status: Status): void {
+    PubSub.publishUnsafe(this.statusPubSub, status)
+  }
+
+  private attach(session: Session): void {
+    this.session = session
+    this.lastInfo = session.info
+    this.lastServer = session.server.hostport
+    this.pingsOut = 0
+    const socket = session.socket
+    socket.on("data", (chunk: Uint8Array) => {
+      if (this.session !== session) return
+      try {
+        session.parser.pushEach(chunk, this.dispatch)
+      } catch (cause) {
+        this.sessionLost(session, new NatsProtocolError({ message: (cause as Error).message }))
+      }
+    })
+    socket.on("error", (cause: Error) =>
+      this.sessionLost(
+        session,
+        new NatsConnectionError({ message: cause.message, server: session.server.hostport, cause }),
+      ))
+    socket.on("close", () => this.sessionLost(session, undefined))
+    this.pingTimer = setInterval(this.onPingTimer, this.config.pingInterval)
+    this.pingTimer.unref?.()
+    this.onInfo(session.info)
+
+    // Resubscribe ahead of publishes buffered while disconnected.
+    const frames: Array<Uint8Array> = []
+    for (const sub of this.subs.values()) {
+      frames.push(NatsProtocol.encodeSubscribe({ subject: sub.subject, queue: sub.queue, sid: sub.sid }))
+      if (sub.max !== undefined) {
+        frames.push(NatsProtocol.encodeUnsubscribe({ sid: sub.sid, max: Math.max(sub.max - sub.received, 0) }))
+      }
+    }
+    for (const pong of this.pendingPongs) {
+      this.pongs.push(pong)
+    }
+    this.outbound = [...frames, ...this.outbound]
+    for (let i = 0; i < this.pendingPongs.length; i++) this.outbound.push(NatsProtocol.PING_FRAME)
+    this.pendingPongs = []
+    this.flushOutbound()
+
+    for (const message of session.leftovers) this.dispatch(message)
+  }
+
+  private readonly onPingTimer = (): void => {
+    const session = this.session
+    if (session === undefined) return
+    if (this.pingsOut >= this.config.maxPingOut) {
+      this.emit({ _tag: "StaleConnection", server: session.server.hostport })
+      this.sessionLost(
+        session,
+        new NatsConnectionError({ message: "stale connection", server: session.server.hostport }),
+      )
+      return
+    }
+    this.pingsOut++
+    this.pongs.push(() => {})
+    this.enqueue(NatsProtocol.PING_FRAME)
+  }
+
+  private readonly dispatch = (message: NatsProtocol.ServerMessage): void => {
+    switch (message._tag) {
+      case "Msg":
+        return this.onMsg(message)
+      case "Ping":
+        this.enqueue(NatsProtocol.PONG_FRAME)
+        return
+      case "Pong": {
+        this.pingsOut = 0
+        this.pongs.shift()?.(undefined)
+        return
+      }
+      case "Info":
+        return this.onInfo(message.info)
+      case "Err":
+        return this.onErr(message.message)
+      case "Ok":
+        return
+    }
+  }
+
+  private onMsg(frame: NatsProtocol.Msg): void {
+    this.inMsgs++
+    this.inBytes += frame.data.length
+    const sub = this.subs.get(frame.sid)
+    if (sub === undefined) return
+    sub.received++
+    sub.deliver(new MsgImpl(this, frame))
+    if (sub.max !== undefined && sub.received >= sub.max) this.removeSub(sub, undefined)
+  }
+
+  private onInfo(info: ServerInfo): void {
+    this.lastInfo = info
+    if (info.ldm) this.emit({ _tag: "LameDuckMode", server: this.lastServer })
+    if (this.config.ignoreClusterUpdates || info.connect_urls === undefined) return
+    const known = new Set(this.servers.map((server) => server.hostport))
+    const added: Array<string> = []
+    for (const url of info.connect_urls) {
+      try {
+        const entry = parseServer(url, true, this.session?.server.url.protocol)
+        if (known.has(entry.hostport)) continue
+        known.add(entry.hostport)
+        this.servers.push(entry)
+        added.push(entry.hostport)
+      } catch {
+        // ignore malformed advertised URLs
+      }
+    }
+    if (added.length > 0) this.emit({ _tag: "ServersChanged", added })
+  }
+
+  private onErr(message: string): void {
+    const permission = permissionPattern.exec(message)
+    if (permission !== null) {
+      const operation = permission[1].toLowerCase() as "publish" | "subscription"
+      const subject = permission[2]
+      const queue = permission[3]
+      const error = new NatsPermissionError({ message, operation, subject, queue })
+      if (operation === "subscription") {
+        for (const sub of [...this.subs.values()]) {
+          if (sub.subject === subject && sub.queue === queue) this.removeSub(sub, error)
+        }
+      } else {
+        for (const [token, request] of this.requests) {
+          if (request.subject !== subject) continue
+          this.requests.delete(token)
+          Deferred.doneUnsafe(request.deferred, Effect.fail(error))
+        }
+      }
+      this.emit({ _tag: "Error", error })
+      return
+    }
+    // The server closes the connection after any other error.
+    const error = serverError(message)
+    this.lastError = error
+    this.emit({ _tag: "Error", error })
+  }
+
+  private sessionLost(session: Session, error: NatsError | undefined): void {
+    if (this.session !== session) return
+    this.session = undefined
+    clearInterval(this.pingTimer)
+    session.socket.destroy()
+    const reason = error ?? this.lastError
+    this.lastError = undefined
+    // Data written before these PINGs may not have reached the server, so
+    // their flushes are retried on the next connection.
+    this.pendingPongs = [...this.pongs, ...this.pendingPongs]
+    this.pongs = []
+    // PINGs are re-sent for `pendingPongs` and PONGs answered a dead connection
+    this.outbound = this.outbound.filter(
+      (frame) => frame !== NatsProtocol.PING_FRAME && frame !== NatsProtocol.PONG_FRAME,
+    )
+    this.outboundSize = this.outbound.reduce((size, frame) => size + frame.length, 0)
+    if (this.isDone) return
+    this.emit({ _tag: "Disconnect", server: session.server.hostport, error: reason })
+    if (!this.config.reconnect || this.draining) {
+      return this.closeWith(
+        reason ?? new NatsConnectionError({ message: "connection lost", server: session.server.hostport }),
+      )
+    }
+    this.lastError = reason
+    this.scheduleReconnect()
+  }
+
+  private scheduleReconnect(): void {
+    if (this.isDone) return
+    const max = this.config.maxReconnectAttempts
+    this.servers = this.servers.filter((server) => max === -1 || server.reconnects < max)
+    const server = this.servers.shift()
+    if (server === undefined) {
+      return this.closeWith(
+        new NatsConnectionError({ message: "exhausted reconnect attempts", cause: this.lastError }),
+      )
+    }
+    this.servers.push(server)
+    const tls = this.config.tls !== undefined || server.url.protocol === "tls:"
+    const jitter = Math.random() * (tls ? this.config.reconnectJitterTls : this.config.reconnectJitter)
+    const wait = Math.max(0, server.lastAttempt + this.config.reconnectTimeWait + jitter - Date.now())
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = undefined
+      if (this.isDone) return
+      server.lastAttempt = Date.now()
+      server.reconnects++
+      this.emit({ _tag: "Reconnecting", server: server.hostport })
+      this.cancelConnect = connectSession(this.config, server, (exit) => {
+        this.cancelConnect = undefined
+        if (this.isDone) {
+          if (Exit.isSuccess(exit)) exit.value.socket.destroy()
+          return
+        }
+        if (Exit.isFailure(exit)) {
+          this.lastError = Cause.squash(exit.cause) as NatsError
+          return this.scheduleReconnect()
+        }
+        server.reconnects = 0
+        this.lastError = undefined
+        this.attach(exit.value)
+        this.emit({ _tag: "Reconnect", server: server.hostport })
+      })
+    }, wait)
+  }
+
+  /** Queues a frame. Returns an error when the reconnect buffer is full. */
+  enqueue(frame: Uint8Array): NatsError | undefined {
+    if (this.session === undefined && this.outboundSize + frame.length > this.config.reconnectBufferSize) {
+      return new NatsConnectionError({ message: "reconnect buffer is full" })
+    }
+    this.outbound.push(frame)
+    this.outboundSize += frame.length
+    if (this.session === undefined) return undefined
+    if (this.outboundSize >= outboundFlushThreshold) {
+      this.flushOutbound()
+    } else if (!this.flushScheduled) {
+      this.flushScheduled = true
+      // A microtask lets fibers publishing in the same tick share one write.
+      queueMicrotask(this.flushOutbound)
+    }
+    return undefined
+  }
+
+  private readonly flushOutbound = (): void => {
+    this.flushScheduled = false
+    const session = this.session
+    if (session === undefined || this.outbound.length === 0) return
+    const frame = NatsProtocol.concatFrames(this.outbound)
+    this.outbound = []
+    this.outboundSize = 0
+    this.outBytes += frame.length
+    session.socket.write(frame)
+  }
+
+  private awaitDrain(): Effect.Effect<void> {
+    const socket = this.session?.socket
+    if (socket === undefined || !socket.writableNeedDrain) return Effect.void
+    return Effect.callback<void>((resume) => {
+      const done = () => {
+        socket.off("drain", done)
+        socket.off("close", done)
+        resume(Effect.void)
+      }
+      socket.on("drain", done)
+      socket.on("close", done)
+      return Effect.sync(() => {
+        socket.off("drain", done)
+        socket.off("close", done)
+      })
+    })
+  }
+
+  publishUnsafe(
+    subject: string,
+    payload: Payload | undefined,
+    options: PublishOptions | undefined,
+  ): NatsError | undefined {
+    if (this.isDone) return new NatsClosedError({ message: "connection is closed" })
+    const data = toBytes(payload)
+    const headers = options?.headers?.encode()
+    if (headers !== undefined && this.lastInfo.headers !== true) {
+      return new NatsInvalidArgumentError({ message: "server does not support headers" })
+    }
+    const size = data.length + (headers?.length ?? 0)
+    if (size > this.lastInfo.max_payload) {
+      return new NatsInvalidArgumentError({
+        message: `payload of ${size} bytes exceeds server max_payload of ${this.lastInfo.max_payload}`,
+      })
+    }
+    let frame: Uint8Array
+    try {
+      frame = NatsProtocol.encodePublish({ subject, reply: options?.reply, headers, data })
+    } catch (cause) {
+      if (cause instanceof NatsProtocol.EncodeError) return new NatsInvalidArgumentError({ message: cause.message })
+      throw cause
+    }
+    const error = this.enqueue(frame)
+    if (error !== undefined) return error
+    this.outMsgs++
+    return undefined
+  }
+
+  readonly publish = (subject: string, payload?: Payload, options?: PublishOptions): Effect.Effect<void, NatsError> =>
+    Effect.suspend(() => {
+      const error = this.publishUnsafe(subject, payload, options)
+      return error !== undefined ? Effect.fail(error) : this.awaitDrain()
+    })
+
+  /**
+   * Registers a subscription and sends `SUB` (when connected; otherwise it is
+   * sent on reconnect along with the others).
+   */
+  private addSub(
+    subject: string,
+    queue: string | undefined,
+    max: number | undefined,
+    deliver: (msg: MsgImpl) => void,
+    end: (error: NatsError | undefined) => void,
+  ): SubState | NatsError {
+    if (this.isDone) return new NatsClosedError({ message: "connection is closed" })
+    if (this.draining) return new NatsClosedError({ message: "connection is draining" })
+    if (max !== undefined && (!Number.isSafeInteger(max) || max < 1)) {
+      return new NatsInvalidArgumentError({ message: "max must be a positive integer" })
+    }
+    const sid = this.nextSid++
+    let frame: Uint8Array
+    try {
+      frame = NatsProtocol.encodeSubscribe({ subject, queue, sid })
+    } catch (cause) {
+      if (cause instanceof NatsProtocol.EncodeError) return new NatsInvalidArgumentError({ message: cause.message })
+      throw cause
+    }
+    const sub: SubState = { sid, subject, queue, max, received: 0, deliver, end }
+    this.subs.set(sid, sub)
+    if (this.session !== undefined) {
+      this.enqueue(frame)
+      if (max !== undefined) this.enqueue(NatsProtocol.encodeUnsubscribe({ sid, max }))
+    }
+    return sub
+  }
+
+  removeSub(sub: SubState, error: NatsError | undefined): void {
+    if (this.subs.get(sub.sid) !== sub) return
+    this.subs.delete(sub.sid)
+    sub.end(error)
+  }
+
+  private unsubscribeUnsafe(sub: SubState, max?: number): void {
+    if (this.subs.get(sub.sid) !== sub) return
+    if (max !== undefined && max > sub.received) {
+      sub.max = max
+      if (this.session !== undefined) this.enqueue(NatsProtocol.encodeUnsubscribe({ sid: sub.sid, max }))
+      return
+    }
+    if (this.session !== undefined && !this.isDone) this.enqueue(NatsProtocol.encodeUnsubscribe({ sid: sub.sid }))
+    this.removeSub(sub, undefined)
+  }
+
+  readonly subscribe = (subject: string, options?: SubscribeOptions) =>
+    Effect
+      .acquireRelease(
+        Effect.flatMap(Queue.unbounded<Msg, NatsError | Cause.Done>(), (queue) => {
+          const sub = this.addSub(
+            subject,
+            options?.queue,
+            options?.max,
+            (msg) => Queue.offerUnsafe(queue, msg),
+            (error) => error === undefined ? Queue.endUnsafe(queue) : Queue.failCauseUnsafe(queue, Cause.fail(error)),
+          )
+          if (!("sid" in sub)) return Effect.fail(sub)
+          const subscription: Subscription = {
+            sid: sub.sid,
+            subject: sub.subject,
+            queue: sub.queue,
+            messages: Stream.fromQueue(queue),
+            unsubscribe: (max) => Effect.sync(() => this.unsubscribeUnsafe(sub, max)),
+            drain: Effect.suspend(() => {
+              if (this.subs.get(sub.sid) !== sub) return Effect.void
+              if (this.session !== undefined) this.enqueue(NatsProtocol.encodeUnsubscribe({ sid: sub.sid }))
+              return Effect.ensuring(this.flush, Effect.sync(() => this.removeSub(sub, undefined)))
+            }),
+          }
+          return Effect.succeed({ sub, subscription })
+        }),
+        ({ sub }) => Effect.sync(() => this.unsubscribeUnsafe(sub)),
+      )
+      .pipe(Effect.map(({ subscription }) => subscription))
+
+  private ensureMux(): NatsError | undefined {
+    if (this.muxSub !== undefined) return undefined
+    const prefix = `${Nuid.createInbox(this.config.inboxPrefix)}.`
+    const sub = this.addSub(
+      `${prefix}*`,
+      undefined,
+      undefined,
+      (msg) => {
+        const token = msg.subject.slice(prefix.length)
+        const request = this.requests.get(token)
+        if (request === undefined) return
+        this.requests.delete(token)
+        Deferred.doneUnsafe(
+          request.deferred,
+          msg.isNoResponders
+            ? Effect.fail(new NatsNoRespondersError({ subject: request.subject }))
+            : Effect.succeed(msg),
+        )
+      },
+      () => {
+        this.muxSub = undefined
+      },
+    )
+    if (!("sid" in sub)) return sub
+    this.muxSub = sub
+    this.muxPrefix = prefix
+    return undefined
+  }
+
+  readonly request = (subject: string, payload?: Payload, options?: RequestOptions): Effect.Effect<Msg, NatsError> =>
+    Effect.suspend(() => {
+      const muxError = this.ensureMux()
+      if (muxError !== undefined) return Effect.fail(muxError)
+      const token = Nuid.next()
+      const deferred = Deferred.makeUnsafe<Msg, NatsError>()
+      this.requests.set(token, { subject, deferred })
+      const error = this.publishUnsafe(subject, payload, { reply: this.muxPrefix + token, headers: options?.headers })
+      if (error !== undefined) {
+        this.requests.delete(token)
+        return Effect.fail(error)
+      }
+      const timeout = options?.timeout ?? "1 second"
+      return Deferred.await(deferred).pipe(
+        Effect.timeoutOrElse({
+          duration: timeout,
+          orElse: () =>
+            Effect.fail(
+              new NatsTimeoutError({
+                message: `request to "${subject}" timed out after ${Duration.toMillis(timeout)}ms`,
+              }),
+            ),
+        }),
+        Effect.ensuring(Effect.sync(() => this.requests.delete(token))),
+      )
+    })
+
+  readonly requestMany = (
+    subject: string,
+    payload?: Payload,
+    options?: RequestManyOptions,
+  ): Stream.Stream<Msg, NatsError> =>
+    Stream.unwrap(
+      Effect
+        .acquireRelease(
+          Effect.flatMap(Queue.unbounded<Msg, NatsError | Cause.Done>(), (queue) => {
+            const maxMessages = options?.maxMessages
+            const stall = options?.stall === undefined ? undefined : Duration.toMillis(options.stall)
+            let stallTimer: ReturnType<typeof setTimeout> | undefined
+            let count = 0
+            let sub: SubState | undefined
+            const stop = () => {
+              if (sub !== undefined) this.unsubscribeUnsafe(sub)
+            }
+            const inbox = Nuid.createInbox(this.config.inboxPrefix)
+            const added = this.addSub(
+              inbox,
+              undefined,
+              undefined,
+              (msg) => {
+                if (count === 0 && msg.isNoResponders) {
+                  return this.removeSub(sub!, new NatsNoRespondersError({ subject }))
+                }
+                if (options?.sentinel && msg.data.length === 0 && msg.headers === undefined) return stop()
+                count++
+                Queue.offerUnsafe(queue, msg)
+                if (maxMessages !== undefined && count >= maxMessages) return stop()
+                if (stall !== undefined) {
+                  clearTimeout(stallTimer)
+                  stallTimer = setTimeout(stop, stall)
+                }
+              },
+              (error) => {
+                clearTimeout(stallTimer)
+                clearTimeout(maxWaitTimer)
+                if (error === undefined) Queue.endUnsafe(queue)
+                else Queue.failCauseUnsafe(queue, Cause.fail(error))
+              },
+            )
+            if (!("sid" in added)) return Effect.fail(added)
+            sub = added
+            const maxWaitTimer = setTimeout(stop, Duration.toMillis(options?.maxWait ?? "1 second"))
+            const error = this.publishUnsafe(subject, payload, { reply: inbox, headers: options?.headers })
+            if (error !== undefined) {
+              stop()
+              return Effect.fail(error)
+            }
+            return Effect.succeed({ stop, stream: Stream.fromQueue(queue) })
+          }),
+          ({ stop }) => Effect.sync(stop),
+        )
+        .pipe(Effect.map(({ stream }) => stream)),
+    )
+
+  readonly flush: Effect.Effect<void, NatsError> = Effect.callback<void, NatsError>((resume) => {
+    if (this.isDone) return resume(Effect.fail(new NatsClosedError({ message: "connection is closed" })))
+    const pong: PongCallback = (error) => resume(error === undefined ? Effect.void : Effect.fail(error))
+    if (this.session === undefined) {
+      this.pendingPongs.push(pong)
+      return
+    }
+    this.pongs.push(pong)
+    this.enqueue(NatsProtocol.PING_FRAME)
+  })
+
+  readonly rtt: Effect.Effect<Duration.Duration, NatsError> = Effect.suspend(() => {
+    const start = performance.now()
+    return Effect.map(this.flush, () => Duration.millis(performance.now() - start))
+  })
+
+  readonly reconnect: Effect.Effect<void, NatsError> = Effect.suspend(() => {
+    if (this.isDone) return Effect.fail(new NatsClosedError({ message: "connection is closed" }))
+    const session = this.session
+    if (session !== undefined) this.sessionLost(session, undefined)
+    return Effect.void
+  })
+
+  readonly drain: Effect.Effect<void, NatsError> = Effect.suspend(() => {
+    if (this.isDone) return Effect.fail(new NatsClosedError({ message: "connection is closed" }))
+    if (this.draining) return Deferred.await(this.closedDeferred)
+    this.draining = true
+    const subs = [...this.subs.values()].filter((sub) => sub !== this.muxSub)
+    if (this.session !== undefined) {
+      for (const sub of subs) this.enqueue(NatsProtocol.encodeUnsubscribe({ sid: sub.sid }))
+    }
+    return this.flush.pipe(
+      Effect.ensuring(Effect.sync(() => {
+        for (const sub of subs) this.removeSub(sub, undefined)
+        this.closeWith(undefined)
+      })),
+    )
+  })
+
+  readonly close: Effect.Effect<void> = Effect.sync(() => this.closeWith(undefined))
+
+  closeWith(error: NatsError | undefined): void {
+    if (this.isDone) return
+    this.isDone = true
+    clearInterval(this.pingTimer)
+    clearTimeout(this.reconnectTimer)
+    this.cancelConnect?.()
+    const session = this.session
+    this.session = undefined
+    if (session !== undefined) {
+      const socket = session.socket
+      const pending = this.outbound.length > 0 ? NatsProtocol.concatFrames(this.outbound) : undefined
+      // Half-close so buffered frames still reach the server, but do not
+      // wait for a peer that never answers.
+      const timer = setTimeout(() => socket.destroy(), 1000)
+      timer.unref?.()
+      socket.once("close", () => clearTimeout(timer))
+      socket.on("error", () => {})
+      if (pending !== undefined) socket.end(pending)
+      else socket.end()
+    }
+    this.outbound = []
+    this.outboundSize = 0
+    const closedError = error ?? new NatsClosedError({ message: "connection is closed" })
+    for (const sub of [...this.subs.values()]) this.removeSub(sub, error)
+    for (const request of this.requests.values()) Deferred.doneUnsafe(request.deferred, Effect.fail(closedError))
+    this.requests.clear()
+    for (const pong of [...this.pongs, ...this.pendingPongs]) pong(closedError)
+    this.pongs = []
+    this.pendingPongs = []
+    this.emit({ _tag: "Close", error })
+    Deferred.doneUnsafe(this.closedDeferred, error === undefined ? Effect.void : Effect.fail(error))
+  }
+}

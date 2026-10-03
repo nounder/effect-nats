@@ -1,0 +1,8 @@
+.DS_Store
+node_modules/
+vendor/
+dist/
+pad/
+.npmrc
+CLAUDE.local.md
+AGENTS.local.md

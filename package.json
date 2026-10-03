@@ -1,0 +1,73 @@
+{
+  "name": "effect-nats",
+  "version": "0.0.0",
+  "license": "MIT",
+  "files": [
+    "src/",
+    "dist/",
+    "README.md",
+    "package.json"
+  ],
+  "type": "module",
+  "exports": {
+    ".": {
+      "bun": "./src/index.ts",
+      "default": "./dist/index.js"
+    },
+    "./NatsConnection": {
+      "bun": "./src/NatsConnection.ts",
+      "default": "./dist/NatsConnection.js"
+    },
+    "./NatsError": {
+      "bun": "./src/NatsError.ts",
+      "default": "./dist/NatsError.js"
+    },
+    "./NatsHeaders": {
+      "bun": "./src/NatsHeaders.ts",
+      "default": "./dist/NatsHeaders.js"
+    },
+    "./Nuid": {
+      "bun": "./src/Nuid.ts",
+      "default": "./dist/Nuid.js"
+    },
+    "./testing": {
+      "bun": "./src/testing/index.ts",
+      "default": "./dist/testing/index.js"
+    },
+    "./internal/*": null,
+    "./*/internal/*": null,
+    "./package.json": "./package.json"
+  },
+  "scripts": {
+    "build": "rm -rf dist && tsc -p tsconfig.build.json",
+    "lint": "oxlint && dprint check",
+    "lint-fix": "oxlint --fix && dprint fmt",
+    "test": "bun test ./test/",
+    "typecheck": "tsc --noEmit -p .",
+    "bench": "node bench/socket-read.ts",
+    "bump": "bun scripts/bump",
+    "prepublishOnly": "bun run build",
+    "deploy": "bunx --bun npm publish --access public"
+  },
+  "devDependencies": {
+    "@dprint/json": "0.21.3",
+    "@dprint/markdown": "0.21.1",
+    "@dprint/typescript": "0.96.0",
+    "@effect/platform-node": "4.0.0",
+    "@types/bun": "1.4.5",
+    "@types/node": "24",
+    "dprint-cli": "0.5.0",
+    "effect": "4.0.0",
+    "oxlint": "1.95.0",
+    "typescript": "7.0.2"
+  },
+  "peerDependencies": {
+    "effect": "^4.0.0"
+  },
+  "overrides": {
+    "@effect/platform-node-shared": "4.0.0"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
