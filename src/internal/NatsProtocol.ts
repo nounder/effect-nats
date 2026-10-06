@@ -490,6 +490,9 @@ export interface Connect {
   readonly user?: string | undefined
   readonly pass?: string | undefined
   readonly auth_token?: string | undefined
+  readonly jwt?: string | undefined
+  readonly nkey?: string | undefined
+  readonly sig?: string | undefined
 }
 
 export const encodeConnect = (options: Connect): Uint8Array =>

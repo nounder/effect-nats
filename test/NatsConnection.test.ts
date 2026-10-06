@@ -1,6 +1,8 @@
 /**
  * Integration tests against a real `nats-server`. Every test shares one
- * server (one container), so keep them in this file.
+ * server (one container), so keep them in this file. The only exception is
+ * decentralized (JWT) auth: operator mode cannot be combined with the users
+ * the other tests need, so those tests start a second server.
  */
 import * as NodeServices from "@effect/platform-node/NodeServices"
 import * as test from "bun:test"
@@ -10,16 +12,24 @@ import * as Effect from "effect/Effect"
 import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
 import * as ManagedRuntime from "effect/ManagedRuntime"
+import * as Redacted from "effect/Redacted"
 import * as Stream from "effect/Stream"
+import * as NFs from "node:fs"
 import * as NatsConnection from "../src/NatsConnection.ts"
 import { NatsHeaders } from "../src/NatsHeaders.ts"
 import * as TestNatsServer from "../src/testing/TestNatsServer.ts"
+
+const fixture = (name: string) => NFs.readFileSync(new URL(`./fixtures/${name}`, import.meta.url), "utf8")
+
+// generated with the official `nk` tool, see fixtures/README.md
+const nkeyUser: { seed: string; publicKey: string } = JSON.parse(fixture("nkey-user.json"))
 
 const serverConfig = `
 max_payload: 1MB
 authorization {
   users = [
     { user: "app", password: "secret" }
+    { nkey: "${nkeyUser.publicKey}", permissions: { publish: { deny: ["nkey.denied"] } } }
     {
       user: "limited", password: "limited"
       permissions: {
@@ -72,6 +82,38 @@ test.describe("connect", () => {
         const error = yield* Effect.flip(NatsConnection.make({ servers: "127.0.0.1:1", connectTimeout: "2 seconds" }))
 
         test.expect(error._tag).toBe("NatsConnectionError")
+      })
+      .pipe(Effect.scoped, runtime.runPromise))
+
+  test.it("authenticates with an NKey seed", () =>
+    Effect
+      .gen(function*() {
+        const nc = yield* connect({ nkey: nkeyUser.seed })
+        // only the NKey user is denied this subject, so this proves who we are
+        const error = yield* Effect.flip(nc.request("nkey.denied", "x", { timeout: "5 seconds" }))
+
+        test.expect(error._tag).toBe("NatsPermissionError")
+      })
+      .pipe(Effect.scoped, runtime.runPromise))
+
+  test.it("fails with NatsAuthorizationError for an unknown NKey", () =>
+    Effect
+      .gen(function*() {
+        // a valid user seed, but not one the server knows
+        const otherSeed = fixture("user.creds").match(/^SU[A-Z2-7]+$/m)![0]
+        const error = yield* Effect.flip(connect({ nkey: otherSeed }))
+
+        test.expect(error._tag).toBe("NatsAuthorizationError")
+      })
+      .pipe(Effect.scoped, runtime.runPromise))
+
+  test.it("rejects an invalid NKey seed before connecting", () =>
+    Effect
+      .gen(function*() {
+        const error = yield* Effect.flip(connect({ nkey: nkeyUser.publicKey }))
+
+        test.expect(error._tag).toBe("NatsInvalidArgumentError")
+        test.expect(error.message).toContain("not a seed")
       })
       .pipe(Effect.scoped, runtime.runPromise))
 
@@ -575,6 +617,91 @@ test.describe("websocket", () => {
         test.expect(error._tag).toBe("NatsConnectionError")
       })
       .pipe(Effect.scoped, runtime.runPromise))
+})
+
+test.describe("decentralized auth", () => {
+  // operator, account and users generated with `nsc`, see fixtures/README.md
+  const operatorRuntime = ManagedRuntime.make(
+    TestNatsServer.layer({ config: fixture("operator.conf") }).pipe(Layer.provide(NodeServices.layer)),
+  )
+
+  test.beforeAll(() =>
+    operatorRuntime.runPromise(Effect.gen(function*() {
+      yield* TestNatsServer.TestNatsServer
+    })), { timeout: 300_000 })
+
+  test.afterAll(() => operatorRuntime.dispose(), { timeout: 30_000 })
+
+  const connectOperator = (config?: NatsConnection.Config) =>
+    Effect.gen(function*() {
+      const server = yield* TestNatsServer.TestNatsServer
+      return yield* NatsConnection.make({ servers: server.url, ...config })
+    })
+
+  const userCreds = fixture("user.creds")
+  const limitedCreds = fixture("limited.creds")
+  const credsPart = (creds: string, index: number) => [...creds.matchAll(/-{3,}[^\n]*-{3,}\n(\S+)\n/g)][index][1]
+
+  test.it("connects with .creds contents", () =>
+    Effect
+      .gen(function*() {
+        const nc = yield* connectOperator({ creds: Redacted.make(userCreds) })
+        const sub = yield* nc.subscribe("jwt.echo")
+        yield* Effect.forkScoped(Stream.runForEach(sub.messages, (msg) => msg.respond(`echo:${msg.string()}`)))
+
+        const reply = yield* nc.request("jwt.echo", "hi")
+
+        test.expect(reply.string()).toBe("echo:hi")
+      })
+      .pipe(Effect.scoped, operatorRuntime.runPromise))
+
+  test.it("connects with a JWT and its NKey seed", () =>
+    Effect
+      .gen(function*() {
+        const nc = yield* connectOperator({ jwt: credsPart(userCreds, 0), nkey: credsPart(userCreds, 1) })
+
+        yield* nc.flush
+      })
+      .pipe(Effect.scoped, operatorRuntime.runPromise))
+
+  test.it("applies permissions from the user JWT", () =>
+    Effect
+      .gen(function*() {
+        const nc = yield* connectOperator({ creds: limitedCreds })
+        const error = yield* Effect.flip(nc.request("forbidden.jwt", "x", { timeout: "5 seconds" }))
+
+        test.expect(error._tag).toBe("NatsPermissionError")
+      })
+      .pipe(Effect.scoped, operatorRuntime.runPromise))
+
+  test.it("fails with NatsAuthorizationError when the seed does not match the JWT", () =>
+    Effect
+      .gen(function*() {
+        const error = yield* Effect.flip(
+          connectOperator({ jwt: credsPart(userCreds, 0), nkey: credsPart(limitedCreds, 1) }),
+        )
+
+        test.expect(error._tag).toBe("NatsAuthorizationError")
+      })
+      .pipe(Effect.scoped, operatorRuntime.runPromise))
+
+  test.it("fails with NatsAuthorizationError without credentials", () =>
+    Effect
+      .gen(function*() {
+        const error = yield* Effect.flip(connectOperator())
+
+        test.expect(error._tag).toBe("NatsAuthorizationError")
+      })
+      .pipe(Effect.scoped, operatorRuntime.runPromise))
+
+  test.it("rejects creds combined with nkey or jwt", () =>
+    Effect
+      .gen(function*() {
+        const error = yield* Effect.flip(connectOperator({ creds: userCreds, nkey: credsPart(userCreds, 1) }))
+
+        test.expect(error._tag).toBe("NatsInvalidArgumentError")
+      })
+      .pipe(Effect.scoped, operatorRuntime.runPromise))
 })
 
 test.describe("lifecycle", () => {

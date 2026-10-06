@@ -82,9 +82,15 @@ bun test NatsProtocol.test.ts
 
 ## Writing tests
 
-- All tests that need a server go in `test/NatsConnection.test.ts`, so a run
-  starts exactly one container. Tests that restart the server go last.
-- Codec tests in `test/NatsProtocol.test.ts` need no server.
+- All tests that need a server go in `test/NatsConnection.test.ts` and share
+  one container. Tests that restart the server go last.
+- The one exception: decentralized (JWT/creds) auth needs a server in operator
+  mode, which cannot also have the configured users the other tests use, so
+  its `describe` block starts a second container with its own runtime.
+- Codec and NKey tests (`test/NatsProtocol.test.ts`, `test/NKeys.test.ts`)
+  need no server.
+- Credentials in `test/fixtures/` were generated with `nk` and `nsc`; see its
+  README before adding more.
 
 ```ts
 // when test runs effect, wrap the entire body in Effect.gen/pipe
