@@ -6,21 +6,26 @@ const HEADER_LINE = "NATS/1.0"
 /**
  * NATS message headers. Keys are case-sensitive and may have multiple values.
  *
- * `code` and `description` carry the optional status from the header line,
- * like `NATS/1.0 503` for "no responders".
+ * `code` and `description` carry the optional status from the header line, like `NATS/1.0 503` for
+ * "no responders".
  */
 export class NatsHeaders implements Iterable<[string, string]> {
   readonly #entries = new Map<string, Array<string>>()
   code = 0
   description = ""
 
-  constructor(init?: Iterable<readonly [string, string]> | Record<string, string | ReadonlyArray<string>>) {
+  constructor(
+    init?: Iterable<readonly [string, string]> | Record<string, string | ReadonlyArray<string>>,
+  ) {
     if (init === undefined) return
-    const entries = Symbol.iterator in init
-      ? init as Iterable<readonly [string, string]>
-      : Object.entries(init).flatMap(([key, value]) =>
-        typeof value === "string" ? [[key, value] as const] : value.map((v) => [key, v] as const)
-      )
+    const entries =
+      Symbol.iterator in init
+        ? (init as Iterable<readonly [string, string]>)
+        : Object.entries(init).flatMap(([key, value]) =>
+            typeof value === "string"
+              ? [[key, value] as const]
+              : value.map((v) => [key, v] as const),
+          )
     for (const [key, value] of entries) this.append(key, value)
   }
 

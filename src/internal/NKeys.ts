@@ -1,10 +1,10 @@
 /**
- * The subset of NATS NKeys needed to authenticate: decoding a seed, deriving
- * its public key, signing the server nonce, and reading `.creds` files.
+ * The subset of NATS NKeys needed to authenticate: decoding a seed, deriving its public key,
+ * signing the server nonce, and reading `.creds` files.
  *
- * An NKey is base32 (RFC 4648, unpadded) of a type prefix, 32 key bytes and a
- * little-endian CRC-16/XMODEM checksum. Seeds carry a two-byte prefix that
- * also encodes the key type. Keys are Ed25519, from `node:crypto`.
+ * An NKey is base32 (RFC 4648, unpadded) of a type prefix, 32 key bytes and a little-endian
+ * CRC-16/XMODEM checksum. Seeds carry a two-byte prefix that also encodes the key type. Keys are
+ * Ed25519, from `node:crypto`.
  *
  * Error messages never include the seed.
  */
@@ -62,7 +62,8 @@ const crc16 = (bytes: Uint8Array): number => {
   let crc = 0
   for (const byte of bytes) {
     crc ^= byte << 8
-    for (let i = 0; i < 8; i++) crc = crc & 0x8000 ? ((crc << 1) ^ 0x1021) & 0xffff : (crc << 1) & 0xffff
+    for (let i = 0; i < 8; i++)
+      crc = crc & 0x8000 ? ((crc << 1) ^ 0x1021) & 0xffff : (crc << 1) & 0xffff
   }
   return crc
 }
@@ -97,7 +98,8 @@ export interface KeyPair {
 
 export const fromSeed = (seed: string): KeyPair => {
   const payload = decode(seed.trim())
-  if (payload.length !== 34 || (payload[0] & 248) !== PREFIX_SEED) throw new Error("invalid NKey: not a seed")
+  if (payload.length !== 34 || (payload[0] & 248) !== PREFIX_SEED)
+    throw new Error("invalid NKey: not a seed")
   const prefix = ((payload[0] & 7) << 5) | ((payload[1] & 248) >> 3)
   if (prefix === PREFIX_CURVE) throw new Error("invalid NKey: curve (X) keys cannot sign")
   if (!PUBLIC_PREFIXES.has(prefix)) throw new Error("invalid NKey: unknown key type")
@@ -114,9 +116,8 @@ export const fromSeed = (seed: string): KeyPair => {
 }
 
 /**
- * Reads the user JWT and NKey seed from `.creds` file contents, as written by
- * `nsc generate creds`: each value sits between `-----BEGIN ...-----` and
- * `------END ...------` lines.
+ * Reads the user JWT and NKey seed from `.creds` file contents, as written by `nsc generate creds`:
+ * each value sits between `-----BEGIN ...-----` and `------END ...------` lines.
  */
 export const parseCreds = (contents: string): { readonly jwt: string; readonly seed: string } => {
   const blocks = [...contents.matchAll(/-{3,}[^\n]*-{3,}\r?\n\s*(\S+)\s*\r?\n\s*-{3,}[^\n]*-{3,}/g)]

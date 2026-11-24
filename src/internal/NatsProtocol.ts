@@ -1,17 +1,16 @@
 /**
  * Wire codec for the NATS client protocol.
  *
- * Every function is pure: bytes in, bytes or plain data out. Nothing here
- * opens a socket, negotiates TLS, or tracks session state. Modeled after the
- * `PgProtocol` codec in `@effect/sql-pg`.
+ * Every function is pure: bytes in, bytes or plain data out. Nothing here opens a socket,
+ * negotiates TLS, or tracks session state. Modeled after the `PgProtocol` codec in
+ * `@effect/sql-pg`.
  *
- * Server frames are a CRLF-terminated control line, followed for `MSG` and
- * `HMSG` by a payload of known size and a trailing CRLF.
+ * Server frames are a CRLF-terminated control line, followed for `MSG` and `HMSG` by a payload of
+ * known size and a trailing CRLF.
  *
- * Encoded frames and decoded payloads are views into pooled buffers that are
- * written once and never rewritten. They stay valid for as long as they are
- * held, but holding one keeps its whole pool buffer (at most 64 KiB, or the
- * size of one oversized message) alive.
+ * Encoded frames and decoded payloads are views into pooled buffers that are written once and never
+ * rewritten. They stay valid for as long as they are held, but holding one keeps its whole pool
+ * buffer (at most 64 KiB, or the size of one oversized message) alive.
  */
 import * as Data from "effect/Data"
 
@@ -63,9 +62,7 @@ export interface Err {
 
 export type ServerMessage = Info | Msg | Ping | Pong | Ok | Err
 
-/**
- * Fields of the server `INFO` JSON this client reads. Servers send more.
- */
+/** Fields of the server `INFO` JSON this client reads. Servers send more. */
 export interface ServerInfo {
   readonly server_id: string
   readonly server_name?: string
@@ -101,18 +98,16 @@ const emptyBytes = new Uint8Array(0)
 const view = (store: ArrayBufferLike, offset: number, length: number): Uint8Array =>
   length === 0 ? emptyBytes : new Uint8Array(store, offset, length)
 
-/**
- * An incremental decoder for the server message stream.
- */
+/** An incremental decoder for the server message stream. */
 export interface Parser {
   /**
-   * Decodes a chunk and returns every complete message. A partial message is
-   * retained for the next call. Parse errors are terminal.
+   * Decodes a chunk and returns every complete message. A partial message is retained for the next
+   * call. Parse errors are terminal.
    */
   readonly push: (chunk: Uint8Array) => ReadonlyArray<ServerMessage>
   /**
-   * Decodes a chunk and passes each complete message to `onMessage`
-   * immediately, without collecting them first.
+   * Decodes a chunk and passes each complete message to `onMessage` immediately, without collecting
+   * them first.
    */
   readonly pushEach: (chunk: Uint8Array, onMessage: (message: ServerMessage) => void) => void
 }
@@ -186,7 +181,8 @@ export const makeParser = (options?: {
     return count
   }
 
-  const argString = (index: number): string => decodeUtf8(buffer, args[index * 2], args[index * 2 + 1])
+  const argString = (index: number): string =>
+    decodeUtf8(buffer, args[index * 2], args[index * 2 + 1])
 
   const argInt = (index: number): number => {
     const from = args[index * 2]
@@ -195,13 +191,18 @@ export const makeParser = (options?: {
     let n = 0
     for (let i = from; i < to; i++) {
       const digit = buffer[i] - 48
-      if (digit < 0 || digit > 9) fail(`invalid number in control line: ${decodeUtf8(buffer, from, to)}`)
+      if (digit < 0 || digit > 9)
+        fail(`invalid number in control line: ${decodeUtf8(buffer, from, to)}`)
       n = n * 10 + digit
     }
     return n
   }
 
-  const controlLine = (from: number, to: number, onMessage: (message: ServerMessage) => void): void => {
+  const controlLine = (
+    from: number,
+    to: number,
+    onMessage: (message: ServerMessage) => void,
+  ): void => {
     if (to === from) return
     // ASCII lowercase: `| 0x20` folds A-Z onto a-z
     const c0 = buffer[from] | 0x20
@@ -223,7 +224,8 @@ export const makeParser = (options?: {
       pendingReply = count === 5 ? argString(2) : undefined
       pendingHeaderSize = argInt(count - 2)
       pendingTotalSize = argInt(count - 1)
-      if (pendingHeaderSize > pendingTotalSize) fail(`invalid HMSG sizes: ${decodeUtf8(buffer, from, to)}`)
+      if (pendingHeaderSize > pendingTotalSize)
+        fail(`invalid HMSG sizes: ${decodeUtf8(buffer, from, to)}`)
     } else if (c0 === 0x70 /* p */ && isOp(buffer, from, to, "ping")) {
       return onMessage(PING)
     } else if (c0 === 0x70 /* p */ && isOp(buffer, from, to, "pong")) {
@@ -242,7 +244,9 @@ export const makeParser = (options?: {
       }
       return onMessage({ _tag: "Info", info })
     } else {
-      return fail(`unknown protocol operation: ${decodeUtf8(buffer, from, Math.min(to, from + 32))}`)
+      return fail(
+        `unknown protocol operation: ${decodeUtf8(buffer, from, Math.min(to, from + 32))}`,
+      )
     }
     if (pendingTotalSize > maxPayloadSize) {
       fail(`message size ${pendingTotalSize} exceeds maxPayloadSize ${maxPayloadSize}`)
@@ -294,7 +298,8 @@ export const makeParser = (options?: {
           }
           if (lf === -1) {
             scanned = end - start
-            if (scanned > maxControlLineSize) fail(`control line exceeds ${maxControlLineSize} bytes`)
+            if (scanned > maxControlLineSize)
+              fail(`control line exceeds ${maxControlLineSize} bytes`)
             break
           }
           scanned = 0
@@ -330,10 +335,10 @@ const textDecoder = new TextDecoder("utf-8", { ignoreBOM: true })
 const asciiDecodeLimit = 16
 
 /** Node's own UTF-8 decoder, faster than `TextDecoder` for short strings. */
-const utf8Slice: ((this: Uint8Array, start: number, end: number) => string) | undefined = (globalThis as any)
-  .Buffer
-  ?.prototype
-  ?.utf8Slice
+const utf8Slice = (
+  globalThis.Buffer?.prototype as
+    { utf8Slice?: (this: Uint8Array, start: number, end: number) => string } | undefined
+)?.utf8Slice
 
 export const decodeUtf8 = (bytes: Uint8Array, from: number, to: number): string => {
   const size = to - from
@@ -355,10 +360,9 @@ export const decodeUtf8 = (bytes: Uint8Array, from: number, to: number): string 
 const asciiEncodeLimit = 48
 
 /**
- * Writes frames back to back into a pooled buffer and hands out a view of
- * each one, so encoding costs no allocation of its own. Bytes below `start`
- * have been handed out and are never rewritten; when the pool runs out it is
- * replaced rather than reused.
+ * Writes frames back to back into a pooled buffer and hands out a view of each one, so encoding
+ * costs no allocation of its own. Bytes below `start` have been handed out and are never rewritten;
+ * when the pool runs out it is replaced rather than reused.
  */
 class Writer {
   readonly poolSize: number
@@ -398,9 +402,8 @@ class Writer {
   }
 
   /**
-   * Writes a subject, queue group or other protocol token. Tokens are
-   * separated by whitespace on the wire, so any whitespace or control
-   * character would let a caller inject protocol.
+   * Writes a subject, queue group or other protocol token. Tokens are separated by whitespace on
+   * the wire, so any whitespace or control character would let a caller inject protocol.
    */
   token(value: string, name: string): void {
     const length = value.length
@@ -423,7 +426,7 @@ class Writer {
         return
       }
     }
-    // oxlint-disable-next-line no-control-regex -- control characters are exactly what must be rejected
+    // eslint-disable-next-line no-control-regex -- control characters are exactly what must be rejected
     if (/[\s\x00-\x1f\x7f]/.test(value)) {
       throw new EncodeError({ message: `${name} must not contain whitespace: "${value}"` })
     }
@@ -456,7 +459,11 @@ class Writer {
   }
 
   finish(): Uint8Array {
-    const value = view(this.bytes.buffer, this.bytes.byteOffset + this.start, this.offset - this.start)
+    const value = view(
+      this.bytes.buffer,
+      this.bytes.byteOffset + this.start,
+      this.offset - this.start,
+    )
     if (this.bytes.length > this.poolSize) {
       // An oversized frame grew the pool; do not keep the rest of it around.
       this.bytes = new Uint8Array(this.poolSize)
@@ -533,9 +540,7 @@ export const encodePublish = (options: {
   return writer.finish()
 }
 
-/**
- * Encodes `SUB`. Throws `EncodeError` when the subject or queue group is not a valid token.
- */
+/** Encodes `SUB`. Throws `EncodeError` when the subject or queue group is not a valid token. */
 export const encodeSubscribe = (options: {
   readonly subject: string
   readonly queue?: string | undefined
@@ -572,9 +577,9 @@ export const encodeUnsubscribe = (options: {
 }
 
 /**
- * Joins frames into one buffer. Frames written back to back by the shared
- * writer are usually contiguous in one pool buffer, in which case a single
- * view spanning them is returned without copying.
+ * Joins frames into one buffer. Frames written back to back by the shared writer are usually
+ * contiguous in one pool buffer, in which case a single view spanning them is returned without
+ * copying.
  */
 export const concatFrames = (frames: ReadonlyArray<Uint8Array>): Uint8Array => {
   if (frames.length === 1) return frames[0]
@@ -584,7 +589,8 @@ export const concatFrames = (frames: ReadonlyArray<Uint8Array>): Uint8Array => {
   for (let i = 1; i < frames.length; i++) {
     const prev = frames[i - 1]
     const frame = frames[i]
-    if (frame.buffer !== first.buffer || frame.byteOffset !== prev.byteOffset + prev.length) contiguous = false
+    if (frame.buffer !== first.buffer || frame.byteOffset !== prev.byteOffset + prev.length)
+      contiguous = false
     length += frame.length
   }
   if (contiguous) return new Uint8Array(first.buffer, first.byteOffset, length)

@@ -15,11 +15,11 @@ This project is in its early stage.
 
 ```ts
 import * as NodeRuntime from "@effect/platform-node/NodeRuntime"
+import { NatsConnection } from "effect-nats"
 import * as Effect from "effect/Effect"
 import * as Stream from "effect/Stream"
-import { NatsConnection } from "effect-nats"
 
-const program = Effect.gen(function*() {
+const program = Effect.gen(function* () {
   const nc = yield* NatsConnection.NatsConnection
 
   // a service: subscriptions are scoped and unsubscribe when the scope closes
@@ -90,9 +90,9 @@ Secrets accept `Redacted` values. Reading a creds file is up to you, for
 example:
 
 ```ts
-const creds = yield* Config.Redacted("NATS_CREDS")
+const creds = yield * Config.Redacted("NATS_CREDS")
 // or: const creds = yield* fs.readFileString("user.creds")
-const nc = yield* NatsConnection.make({ servers: "tls://connect.ngs.global", creds })
+const nc = yield * NatsConnection.make({ servers: "tls://connect.ngs.global", creds })
 ```
 
 ## Testing helpers

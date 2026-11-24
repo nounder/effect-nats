@@ -1,7 +1,7 @@
+import * as NNet from "node:net"
 /**
- * Minimal container runner for tests. Drives the `docker` or `podman` CLI,
- * whichever is available (or the `CONTAINER_RUNTIME` config), and removes
- * containers when their scope closes.
+ * Minimal container runner for tests. Drives the `docker` or `podman` CLI, whichever is available
+ * (or the `CONTAINER_RUNTIME` config), and removes containers when their scope closes.
  */
 import * as Config from "effect/Config"
 import * as Context from "effect/Context"
@@ -15,7 +15,6 @@ import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner"
 import * as Schedule from "effect/Schedule"
 import type * as Scope from "effect/Scope"
 import * as Stream from "effect/Stream"
-import * as NNet from "node:net"
 
 export class DockerError extends Data.TaggedError("DockerError")<{
   readonly message: string
@@ -49,8 +48,8 @@ export interface Container {
   readonly stop: Effect.Effect<void, DockerError>
   readonly start: Effect.Effect<void, DockerError>
   /**
-   * Waits until `pattern` appears in the logs `count` times, so a restarted
-   * container can be awaited by counting past earlier matches.
+   * Waits until `pattern` appears in the logs `count` times, so a restarted container can be
+   * awaited by counting past earlier matches.
    */
   readonly waitForLog: (
     pattern: RegExp,
@@ -63,91 +62,102 @@ export interface DockerService {
   readonly run: (options: RunOptions) => Effect.Effect<Container, DockerError, Scope.Scope>
 }
 
-export class Docker extends Context.Service<Docker, DockerService>()("effect-nats/testing/Docker") {}
+export class Docker extends Context.Service<Docker, DockerService>()(
+  "effect-nats/testing/Docker",
+) {}
 
 const exec = (
   spawner: ChildProcessSpawner.ChildProcessSpawner["Service"],
   runtime: Runtime,
   args: ReadonlyArray<string>,
 ) =>
-  Effect
-    .scoped(
-      Effect.gen(function*() {
-        const handle = yield* spawner.spawn(ChildProcess.make(runtime, args, { stdout: "pipe", stderr: "pipe" }))
-        const [stdout, stderr, exitCode] = yield* Effect.all(
-          [
-            handle.stdout.pipe(Stream.decodeText(), Stream.mkString),
-            handle.stderr.pipe(Stream.decodeText(), Stream.mkString),
-            handle.exitCode,
-          ],
-          { concurrency: "unbounded" },
-        )
-        if (exitCode !== 0) {
-          return yield* new DockerError({
-            message: `${runtime} ${args[0]} exited with code ${exitCode}: ${stderr.trim()}`,
-          })
-        }
-        return { stdout, stderr }
-      }),
-    )
-    .pipe(
-      Effect.catchTag(
-        "PlatformError",
-        (cause) => Effect.fail(new DockerError({ message: `failed to run ${runtime} ${args[0]}`, cause })),
-      ),
-    )
+  Effect.scoped(
+    Effect.gen(function* () {
+      const handle = yield* spawner.spawn(
+        ChildProcess.make(runtime, args, { stdout: "pipe", stderr: "pipe" }),
+      )
+      const [stdout, stderr, exitCode] = yield* Effect.all(
+        [
+          handle.stdout.pipe(Stream.decodeText(), Stream.mkString),
+          handle.stderr.pipe(Stream.decodeText(), Stream.mkString),
+          handle.exitCode,
+        ],
+        { concurrency: "unbounded" },
+      )
+      if (exitCode !== 0) {
+        return yield* new DockerError({
+          message: `${runtime} ${args[0]} exited with code ${exitCode}: ${stderr.trim()}`,
+        })
+      }
+      return { stdout, stderr }
+    }),
+  ).pipe(
+    Effect.catchTag("PlatformError", (cause) =>
+      Effect.fail(new DockerError({ message: `failed to run ${runtime} ${args[0]}`, cause })),
+    ),
+  )
 
 export const freePort = Effect.callback<number, DockerError>((resume) => {
   const server = NNet.createServer()
-  server.once("error", (cause) => resume(Effect.fail(new DockerError({ message: "no free port", cause }))))
+  server.once("error", (cause) =>
+    resume(Effect.fail(new DockerError({ message: "no free port", cause }))),
+  )
   server.listen(0, "127.0.0.1", () => {
     const port = (server.address() as NNet.AddressInfo).port
     server.close(() => resume(Effect.succeed(port)))
   })
 })
 
-const isAvailable = (spawner: ChildProcessSpawner.ChildProcessSpawner["Service"], runtime: Runtime) =>
-  spawner.exitCode(ChildProcess.make(runtime, ["info"], { stdout: "ignore", stderr: "ignore" })).pipe(
-    Effect.map((code) => code === 0),
-    Effect.orElseSucceed(() => false),
-  )
+const isAvailable = (
+  spawner: ChildProcessSpawner.ChildProcessSpawner["Service"],
+  runtime: Runtime,
+) =>
+  spawner
+    .exitCode(ChildProcess.make(runtime, ["info"], { stdout: "ignore", stderr: "ignore" }))
+    .pipe(
+      Effect.map((code) => code === 0),
+      Effect.orElseSucceed(() => false),
+    )
 
 /**
- * The `CONTAINER_RUNTIME` config if set, otherwise the first of `docker` and
- * `podman` whose daemon (or machine) responds.
+ * The `CONTAINER_RUNTIME` config if set, otherwise the first of `docker` and `podman` whose daemon
+ * (or machine) responds.
  */
 const detectRuntime: Effect.Effect<
   Runtime,
   DockerError | Config.ConfigError,
   ChildProcessSpawner.ChildProcessSpawner
-> = Effect
-  .gen(function*() {
-    const spawner = yield* ChildProcessSpawner.ChildProcessSpawner
-    const forced = yield* Config.option(Config.Literals(["docker", "podman"], "CONTAINER_RUNTIME"))
-    if (Option.isSome(forced)) return forced.value
-    for (const runtime of ["docker", "podman"] as const) {
-      if (yield* isAvailable(spawner, runtime)) return runtime
-    }
-    return yield* new DockerError({ message: "neither docker nor podman is available" })
-  })
+> = Effect.gen(function* () {
+  const spawner = yield* ChildProcessSpawner.ChildProcessSpawner
+  const forced = yield* Config.option(Config.Literals(["docker", "podman"], "CONTAINER_RUNTIME"))
+  if (Option.isSome(forced)) return forced.value
+  for (const runtime of ["docker", "podman"] as const) {
+    if (yield* isAvailable(spawner, runtime)) return runtime
+  }
+  return yield* new DockerError({ message: "neither docker nor podman is available" })
+})
 
-const make = (runtime: Runtime): Effect.Effect<DockerService, never, ChildProcessSpawner.ChildProcessSpawner> =>
-  Effect.gen(function*() {
+const make = (
+  runtime: Runtime,
+): Effect.Effect<DockerService, never, ChildProcessSpawner.ChildProcessSpawner> =>
+  Effect.gen(function* () {
     const spawner = yield* ChildProcessSpawner.ChildProcessSpawner
     const run = (...args: ReadonlyArray<string>) => exec(spawner, runtime, args)
 
     return {
       runtime,
       run: (options) =>
-        Effect.gen(function*() {
+        Effect.gen(function* () {
           const ports = new Map<number, number>()
           for (const containerPort of options.ports ?? []) ports.set(containerPort, yield* freePort)
 
           const args = ["run", "-d"]
           if (options.name !== undefined) args.push("--name", options.name)
-          for (const [key, value] of Object.entries(options.env ?? {})) args.push("-e", `${key}=${value}`)
+          for (const [key, value] of Object.entries(options.env ?? {}))
+            args.push("-e", `${key}=${value}`)
           // Fixed host ports keep the mapping stable across stop/start.
-          for (const [containerPort, hostPort] of ports) args.push("-p", `127.0.0.1:${hostPort}:${containerPort}`)
+          for (const [containerPort, hostPort] of ports)
+            args.push("-p", `127.0.0.1:${hostPort}:${containerPort}`)
           if (options.entrypoint !== undefined) args.push("--entrypoint", options.entrypoint)
           args.push(options.image, ...(options.args ?? []))
 
@@ -163,7 +173,8 @@ const make = (runtime: Runtime): Effect.Effect<DockerService, never, ChildProces
             host: "127.0.0.1",
             port: (containerPort) => {
               const hostPort = ports.get(containerPort)
-              if (hostPort === undefined) throw new Error(`container port ${containerPort} is not published`)
+              if (hostPort === undefined)
+                throw new Error(`container port ${containerPort} is not published`)
               return hostPort
             },
             logs,
@@ -178,7 +189,8 @@ const make = (runtime: Runtime): Effect.Effect<DockerService, never, ChildProces
               const check = Effect.flatMap(logs, (output) =>
                 (output.match(global)?.length ?? 0) >= count
                   ? Effect.void
-                  : Effect.fail(new DockerError({ message: `waiting for ${pattern}` })))
+                  : Effect.fail(new DockerError({ message: `waiting for ${pattern}` })),
+              )
               return check.pipe(
                 Effect.retry({
                   while: (error) => error.message.startsWith("waiting for"),
@@ -189,8 +201,11 @@ const make = (runtime: Runtime): Effect.Effect<DockerService, never, ChildProces
                   orElse: () =>
                     Effect.flatMap(logs, (output) =>
                       Effect.fail(
-                        new DockerError({ message: `timed out waiting for ${pattern} in logs of ${id}:\n${output}` }),
-                      )),
+                        new DockerError({
+                          message: `timed out waiting for ${pattern} in logs of ${id}:\n${output}`,
+                        }),
+                      ),
+                    ),
                 }),
               )
             },
@@ -208,7 +223,4 @@ export const layer: Layer.Layer<
   Docker,
   DockerError | Config.ConfigError,
   ChildProcessSpawner.ChildProcessSpawner
-> = Layer.effect(
-  Docker,
-  Effect.flatMap(detectRuntime, make),
-)
+> = Layer.effect(Docker, Effect.flatMap(detectRuntime, make))

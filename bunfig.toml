@@ -12,4 +12,29 @@ singleAttributePerLine = true
 sortImports = { newlinesBetween = false }
 sortPackageJson = true
 jsdoc = true
-ignorePatterns = ["**/node_modules", "**/*-lock.json", "vscode/*.json"]
+ignorePatterns = [
+  ".agents/**",
+  ".build/**",
+  "dist/**",
+  "pad/**",
+  "**/node_modules",
+  "**/*-lock.json",
+  "vscode/*.json",
+]
+
+[lint]
+typeAware = false
+ignorePatterns = [".agents/", ".build/", "dist/"]
+
+[lint.categories]
+correctness = "error"
+
+[lint.rules]
+"eslint/no-console" = "warn"
+"import/no-default-export" = "error"
+# Subscription cleanup iterates snapshots while mutating the underlying map.
+"unicorn/no-useless-spread" = "off"
+
+[[lint.overrides]]
+files = ["bench/**"]
+rules = { "eslint/no-console" = "off" }

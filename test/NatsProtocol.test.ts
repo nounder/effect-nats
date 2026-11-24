@@ -16,8 +16,7 @@ const stream = [
   "+OK\r\n",
   "-ERR 'Authorization Violation'\r\n",
   "PONG\r\n",
-]
-  .join("")
+].join("")
 
 const summarize = (messages: ReadonlyArray<NatsProtocol.ServerMessage>): Array<unknown> =>
   messages.map((message) => {
@@ -43,8 +42,22 @@ const expected = [
   { _tag: "Ping" },
   { _tag: "Msg", subject: "foo.bar", sid: 1, reply: undefined, headers: undefined, data: "hello" },
   { _tag: "Msg", subject: "foo.bar", sid: 2, reply: "_INBOX.x", headers: undefined, data: "" },
-  { _tag: "Msg", subject: "foo", sid: 3, reply: "reply", headers: "NATS/1.0\r\nX-Key: v\r\n\r\n", data: "world" },
-  { _tag: "Msg", subject: "foo", sid: 4, reply: undefined, headers: "NATS/1.0 503\r\n\r\n", data: "" },
+  {
+    _tag: "Msg",
+    subject: "foo",
+    sid: 3,
+    reply: "reply",
+    headers: "NATS/1.0\r\nX-Key: v\r\n\r\n",
+    data: "world",
+  },
+  {
+    _tag: "Msg",
+    subject: "foo",
+    sid: 4,
+    reply: undefined,
+    headers: "NATS/1.0 503\r\n\r\n",
+    data: "",
+  },
   { _tag: "Ok" },
   { _tag: "Err", message: "Authorization Violation" },
   { _tag: "Pong" },
@@ -87,10 +100,12 @@ test.describe("makeParser", () => {
   test.it("accepts lowercase operations and tabs", () => {
     const parser = NatsProtocol.makeParser()
 
-    test.expect(summarize(parser.push(bytes("msg\tfoo\t1\t2\r\nhi\r\nping\r\n")))).toEqual([
-      { _tag: "Msg", subject: "foo", sid: 1, reply: undefined, headers: undefined, data: "hi" },
-      { _tag: "Ping" },
-    ])
+    test
+      .expect(summarize(parser.push(bytes("msg\tfoo\t1\t2\r\nhi\r\nping\r\n"))))
+      .toEqual([
+        { _tag: "Msg", subject: "foo", sid: 1, reply: undefined, headers: undefined, data: "hi" },
+        { _tag: "Ping" },
+      ])
   })
 
   test.it("fails on unknown operations and stays failed", () => {
@@ -121,34 +136,40 @@ test.describe("makeParser", () => {
 
 test.describe("encode", () => {
   test.it("encodes PUB and HPUB", () => {
-    test.expect(text(NatsProtocol.encodePublish({ subject: "foo", data: bytes("hello") }))).toBe(
-      "PUB foo 5\r\nhello\r\n",
-    )
-    test.expect(text(NatsProtocol.encodePublish({ subject: "foo", reply: "bar", data: new Uint8Array() }))).toBe(
-      "PUB foo bar 0\r\n\r\n",
-    )
+    test
+      .expect(text(NatsProtocol.encodePublish({ subject: "foo", data: bytes("hello") })))
+      .toBe("PUB foo 5\r\nhello\r\n")
+    test
+      .expect(
+        text(NatsProtocol.encodePublish({ subject: "foo", reply: "bar", data: new Uint8Array() })),
+      )
+      .toBe("PUB foo bar 0\r\n\r\n")
     const headers = new NatsHeaders({ A: "1" }).encode()
-    test.expect(text(NatsProtocol.encodePublish({ subject: "ü", headers, data: bytes("x") }))).toBe(
-      "HPUB ü 18 19\r\nNATS/1.0\r\nA: 1\r\n\r\nx\r\n",
-    )
+    test
+      .expect(text(NatsProtocol.encodePublish({ subject: "ü", headers, data: bytes("x") })))
+      .toBe("HPUB ü 18 19\r\nNATS/1.0\r\nA: 1\r\n\r\nx\r\n")
   })
 
   test.it("encodes SUB and UNSUB", () => {
-    test.expect(text(NatsProtocol.encodeSubscribe({ subject: "foo.*", sid: 12 }))).toBe("SUB foo.* 12\r\n")
-    test.expect(text(NatsProtocol.encodeSubscribe({ subject: "foo", queue: "q", sid: 1 }))).toBe("SUB foo q 1\r\n")
+    test
+      .expect(text(NatsProtocol.encodeSubscribe({ subject: "foo.*", sid: 12 })))
+      .toBe("SUB foo.* 12\r\n")
+    test
+      .expect(text(NatsProtocol.encodeSubscribe({ subject: "foo", queue: "q", sid: 1 })))
+      .toBe("SUB foo q 1\r\n")
     test.expect(text(NatsProtocol.encodeUnsubscribe({ sid: 7 }))).toBe("UNSUB 7\r\n")
     test.expect(text(NatsProtocol.encodeUnsubscribe({ sid: 7, max: 100 }))).toBe("UNSUB 7 100\r\n")
   })
 
   test.it("rejects tokens that would inject protocol", () => {
     for (const subject of ["", "a b", "a\tb", "a\r\nPING", "ä b"]) {
-      test.expect(() => NatsProtocol.encodePublish({ subject, data: new Uint8Array() })).toThrow(
-        NatsProtocol.EncodeError,
-      )
+      test
+        .expect(() => NatsProtocol.encodePublish({ subject, data: new Uint8Array() }))
+        .toThrow(NatsProtocol.EncodeError)
     }
-    test.expect(() => NatsProtocol.encodeSubscribe({ subject: "a", queue: "q q", sid: 1 })).toThrow(
-      NatsProtocol.EncodeError,
-    )
+    test
+      .expect(() => NatsProtocol.encodeSubscribe({ subject: "a", queue: "q q", sid: 1 }))
+      .toThrow(NatsProtocol.EncodeError)
   })
 
   test.it("joins contiguous frames without copying", () => {
@@ -158,15 +179,19 @@ test.describe("encode", () => {
 
     test.expect(joined.buffer).toBe(a.buffer)
     test.expect(text(joined)).toBe("UNSUB 1\r\nUNSUB 2\r\n")
-    test.expect(text(NatsProtocol.concatFrames([a, NatsProtocol.PING_FRAME, b]))).toBe(
-      "UNSUB 1\r\nPING\r\nUNSUB 2\r\n",
-    )
+    test
+      .expect(text(NatsProtocol.concatFrames([a, NatsProtocol.PING_FRAME, b])))
+      .toBe("UNSUB 1\r\nPING\r\nUNSUB 2\r\n")
   })
 })
 
 test.describe("NatsHeaders", () => {
   test.it("encodes and decodes values and status", () => {
-    const headers = new NatsHeaders([["X-A", "1"], ["X-A", "2"], ["X-B", " spaced "]])
+    const headers = new NatsHeaders([
+      ["X-A", "1"],
+      ["X-A", "2"],
+      ["X-B", " spaced "],
+    ])
     const decoded = NatsHeaders.decode(headers.encode())
 
     test.expect(decoded.getAll("X-A")).toEqual(["1", "2"])

@@ -7,6 +7,9 @@ Use Bun as package manager and test runner. The library itself only depends on
 bun install
 # type check
 bun run typecheck
+# lint and format
+bun lint
+bun fmt
 ```
 
 # Code
@@ -26,10 +29,10 @@ bun run typecheck
 ## Import rules
 
 ```ts
-// when importing Node modules name them like such:
-import * as NNet from "node:net"
 // always import test module as namespace:
 import * as test from "bun:test"
+// when importing Node modules name them like such:
+import * as NNet from "node:net"
 // import Effect sub-modules directly
 import * as Stream from "effect/Stream"
 // Always use extension in local module imports:
@@ -95,9 +98,10 @@ bun test NatsProtocol.test.ts
 ```ts
 // when test runs effect, wrap the entire body in Effect.gen/pipe
 test.it("does something", () =>
-  Effect.gen(function*() {
+  Effect.gen(function* () {
     const nc = yield* connect()
 
     test.expect(yield* nc.isClosed).toBe(false)
-  }).pipe(Effect.scoped, runtime.runPromise))
+  }).pipe(Effect.scoped, runtime.runPromise),
+)
 ```

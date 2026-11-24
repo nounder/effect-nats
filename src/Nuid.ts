@@ -10,9 +10,9 @@ const MAX_INC = 333
 const randomUint32 = () => crypto.getRandomValues(new Uint32Array(1))[0]
 
 /**
- * Generator of NATS unique identifiers: a 12 char random prefix followed by a
- * 10 char sequence incremented by a random step. Same scheme as `nats.js`, so
- * ids are 22 chars long and safe to use in subject tokens.
+ * Generator of NATS unique identifiers: a 12 char random prefix followed by a 10 char sequence
+ * incremented by a random step. Same scheme as `nats.js`, so ids are 22 chars long and safe to use
+ * in subject tokens.
  */
 class NuidGenerator {
   #prefix = ""
