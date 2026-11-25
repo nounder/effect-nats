@@ -18,7 +18,7 @@ const program = Effect.gen(function* () {
     Stream.runForEach(sub.messages, (msg) => msg.respond(`hello, ${msg.subject.slice(6)}`)),
   )
 
-  const reply = yield* nc.request("greet.world", undefined, { timeout: "2 seconds" })
+  const reply = yield* nc.request("greet.world").pipe(Effect.timeout("2 seconds"))
   yield* Console.log(reply.string())
 
   yield* nc.publish("events.created", JSON.stringify({ id: 1 }))

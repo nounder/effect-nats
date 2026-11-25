@@ -1,7 +1,9 @@
 /**
  * Run with a nats-server on localhost:4222 (or set NATS_URL, which may also be a ws:// URL):
  *
- * Node examples/basic.ts
+ * ```sh
+ * node examples/Basic.ts
+ * ```
  */
 import * as NodeRuntime from "@effect/platform-node/NodeRuntime"
 import { NatsConnection } from "effect-nats"
@@ -21,7 +23,7 @@ const program = Effect.gen(function* () {
     ),
   )
 
-  const reply = yield* nc.request("greet.world", undefined, { timeout: "2 seconds" })
+  const reply = yield* nc.request("greet.world").pipe(Effect.timeout("2 seconds"))
   yield* Console.log(reply.string())
 
   yield* nc.drain

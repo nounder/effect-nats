@@ -38,7 +38,6 @@ import {
   NatsNoRespondersError,
   NatsPermissionError,
   NatsProtocolError,
-  NatsTimeoutError,
 } from "./NatsError.ts"
 import { NatsHeaders } from "./NatsHeaders.ts"
 import * as Nuid from "./Nuid.ts"
@@ -135,20 +134,6 @@ export interface SubscribeOptions {
 }
 
 export interface RequestOptions {
-  /** @default "1 second" */
-  readonly timeout?: Duration.Input | undefined
-  readonly headers?: NatsHeaders | undefined
-}
-
-export interface RequestManyOptions {
-  /** Upper bound on how long responses are collected. @default "1 second" */
-  readonly maxWait?: Duration.Input | undefined
-  /** Stop after this many responses. */
-  readonly maxMessages?: number | undefined
-  /** Stop when no response arrives within this time after the previous one. */
-  readonly stall?: Duration.Input | undefined
-  /** Stop at the first response with an empty payload and no headers. */
-  readonly sentinel?: boolean | undefined
   readonly headers?: NatsHeaders | undefined
 }
 
@@ -227,16 +212,32 @@ export interface NatsConnection {
     subject: string,
     options?: SubscribeOptions,
   ) => Effect.Effect<Subscription, NatsError, Scope.Scope>
+  /**
+   * Publishes a request and waits for the first reply. Fails with `NatsNoRespondersError` when
+   * nobody subscribes to `subject`.
+   */
   readonly request: (
     subject: string,
     payload?: Payload,
     options?: RequestOptions,
   ) => Effect.Effect<Msg, NatsError>
-  /** Publishes a request and streams every response until a `RequestManyOptions` limit is hit. */
+  /**
+   * Publishes a request and streams every reply, for scatter-gather and chunked responses. Fails
+   * with `NatsNoRespondersError` when nobody subscribes to `subject`.
+   *
+   * The stream does not end by itself; bound it with Stream operators:
+   *
+   * - `Stream.take(n)`: at most `n` replies
+   * - `Stream.interruptWhen(Effect.sleep(d))`: collect for `d`
+   * - `Stream.timeout(d)`: stop once no reply arrives for `d`
+   * - `Stream.takeWhile((msg) => msg.data.length > 0)`: stop at an empty sentinel
+   *
+   * However the stream ends, its reply subscription is removed.
+   */
   readonly requestMany: (
     subject: string,
     payload?: Payload,
-    options?: RequestManyOptions,
+    options?: RequestOptions,
   ) => Stream.Stream<Msg, NatsError>
   /** Round trip to the server: everything published before has been processed. */
   readonly flush: Effect.Effect<void, NatsError>
@@ -1226,7 +1227,9 @@ class NatsConnectionImpl implements NatsConnection {
     payload?: Payload,
     options?: RequestOptions,
   ): Effect.Effect<Msg, NatsError> =>
-    Effect.suspend(() => {
+    // Registering and attaching the cleanup must not be split by an
+    // interrupt, so only the wait for the reply is interruptible.
+    Effect.uninterruptibleMask((restore) => {
       const muxError = this.ensureMux()
       if (muxError !== undefined) return Effect.fail(muxError)
       const token = Nuid.next()
@@ -1240,17 +1243,7 @@ class NatsConnectionImpl implements NatsConnection {
         this.requests.delete(token)
         return Effect.fail(error)
       }
-      const timeout = options?.timeout ?? "1 second"
-      return Deferred.await(deferred).pipe(
-        Effect.timeoutOrElse({
-          duration: timeout,
-          orElse: () =>
-            Effect.fail(
-              new NatsTimeoutError({
-                message: `request to "${subject}" timed out after ${Duration.toMillis(timeout)}ms`,
-              }),
-            ),
-        }),
+      return restore(Deferred.await(deferred)).pipe(
         Effect.ensuring(Effect.sync(() => this.requests.delete(token))),
       )
     })
@@ -1258,58 +1251,43 @@ class NatsConnectionImpl implements NatsConnection {
   readonly requestMany = (
     subject: string,
     payload?: Payload,
-    options?: RequestManyOptions,
+    options?: RequestOptions,
   ): Stream.Stream<Msg, NatsError> =>
     Stream.unwrap(
       Effect.acquireRelease(
         Effect.flatMap(Queue.unbounded<Msg, NatsError | Cause.Done>(), (queue) => {
-          const maxMessages = options?.maxMessages
-          const stall = options?.stall === undefined ? undefined : Duration.toMillis(options.stall)
-          let stallTimer: ReturnType<typeof setTimeout> | undefined
-          let count = 0
-          const stop = () => {
-            this.unsubscribeUnsafe(sub)
-          }
+          let sub: SubState | undefined
+          let first = true
           const inbox = Nuid.createInbox(this.config.inboxPrefix)
           const added = this.addSub(
             inbox,
             undefined,
             undefined,
             (msg) => {
-              if (count === 0 && msg.isNoResponders) {
-                return this.removeSub(sub, new NatsNoRespondersError({ subject }))
+              if (first && msg.isNoResponders) {
+                return this.removeSub(sub!, new NatsNoRespondersError({ subject }))
               }
-              if (options?.sentinel && msg.data.length === 0 && msg.headers === undefined)
-                return stop()
-              count++
+              first = false
               Queue.offerUnsafe(queue, msg)
-              if (maxMessages !== undefined && count >= maxMessages) return stop()
-              if (stall !== undefined) {
-                clearTimeout(stallTimer)
-                stallTimer = setTimeout(stop, stall)
-              }
             },
-            (error) => {
-              clearTimeout(stallTimer)
-              clearTimeout(maxWaitTimer)
-              if (error === undefined) Queue.endUnsafe(queue)
-              else Queue.failCauseUnsafe(queue, Cause.fail(error))
-            },
+            (error) =>
+              error === undefined
+                ? Queue.endUnsafe(queue)
+                : Queue.failCauseUnsafe(queue, Cause.fail(error)),
           )
           if (!("sid" in added)) return Effect.fail(added)
-          const sub = added
-          const maxWaitTimer = setTimeout(stop, Duration.toMillis(options?.maxWait ?? "1 second"))
+          sub = added
           const error = this.publishUnsafe(subject, payload, {
             reply: inbox,
             headers: options?.headers,
           })
           if (error !== undefined) {
-            stop()
+            this.unsubscribeUnsafe(added)
             return Effect.fail(error)
           }
-          return Effect.succeed({ stop, stream: Stream.fromQueue(queue) })
+          return Effect.succeed({ sub: added, stream: Stream.fromQueue(queue) })
         }),
-        ({ stop }) => Effect.sync(stop),
+        ({ sub }) => Effect.sync(() => this.unsubscribeUnsafe(sub)),
       ).pipe(Effect.map(({ stream }) => stream)),
     )
 

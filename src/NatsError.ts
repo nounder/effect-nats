@@ -30,10 +30,6 @@ export class NatsInvalidArgumentError extends Data.TaggedError("NatsInvalidArgum
   readonly message: string
 }> {}
 
-export class NatsTimeoutError extends Data.TaggedError("NatsTimeoutError")<{
-  readonly message: string
-}> {}
-
 /** Request was published to a subject with no subscribers. */
 export class NatsNoRespondersError extends Data.TaggedError("NatsNoRespondersError")<{
   readonly subject: string
@@ -54,6 +50,5 @@ export type NatsError =
   | NatsPermissionError
   | NatsProtocolError
   | NatsInvalidArgumentError
-  | NatsTimeoutError
   | NatsNoRespondersError
   | NatsClosedError

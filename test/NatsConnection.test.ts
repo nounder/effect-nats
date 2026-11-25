@@ -97,7 +97,7 @@ test.describe("connect", () => {
     Effect.gen(function* () {
       const nc = yield* connect({ nkey: nkeyUser.seed })
       // only the NKey user is denied this subject, so this proves who we are
-      const error = yield* Effect.flip(nc.request("nkey.denied", "x", { timeout: "5 seconds" }))
+      const error = yield* Effect.flip(nc.request("nkey.denied", "x"))
 
       test.expect(error._tag).toBe("NatsPermissionError")
     }).pipe(Effect.scoped, runtime.runPromise),
@@ -456,53 +456,88 @@ test.describe("request", () => {
     }).pipe(Effect.scoped, runtime.runPromise),
   )
 
-  test.it("fails with NatsTimeoutError when nobody answers", () =>
+  test.it("is bounded with Effect.timeout and drops late replies", () =>
     Effect.gen(function* () {
       const nc = yield* connect()
-      const sub = yield* nc.subscribe("req.silent")
-      yield* Effect.forkScoped(Stream.runDrain(sub.messages))
-      const error = yield* Effect.flip(nc.request("req.silent", "x", { timeout: "100 millis" }))
+      const sub = yield* nc.subscribe("req.slow")
+      const delays: Record<string, Duration.Input> = { slow: "300 millis", slower: "400 millis" }
+      yield* Effect.forkScoped(
+        sub.messages.pipe(
+          Stream.mapEffect(
+            (msg) => Effect.andThen(Effect.sleep(delays[msg.string()]), msg.respond(msg.string())),
+            { concurrency: "unbounded" },
+          ),
+          Stream.runDrain,
+        ),
+      )
 
-      test.expect(error._tag).toBe("NatsTimeoutError")
+      const error = yield* Effect.flip(
+        nc.request("req.slow", "slow").pipe(Effect.timeout("100 millis")),
+      )
+      // the reply to "slow" lands while this request is still waiting
+      const reply = yield* nc.request("req.slow", "slower").pipe(Effect.timeout("2 seconds"))
+
+      test.expect(error._tag).toBe("TimeoutError")
+      test.expect(reply.string()).toBe("slower")
     }).pipe(Effect.scoped, runtime.runPromise),
   )
 
   test.it("fails with NatsPermissionError when publish permission is denied", () =>
     Effect.gen(function* () {
       const nc = yield* connect({ user: "limited", pass: "limited" })
-      const error = yield* Effect.flip(nc.request("forbidden.req", "x", { timeout: "5 seconds" }))
+      const error = yield* Effect.flip(nc.request("forbidden.req", "x"))
 
       test.expect(error._tag).toBe("NatsPermissionError")
     }).pipe(Effect.scoped, runtime.runPromise),
   )
 
-  test.it("requestMany collects up to maxMessages", () =>
+  test.it("requestMany is bounded with Stream.take", () =>
     Effect.gen(function* () {
       const nc = yield* connect()
       for (let i = 0; i < 3; i++) yield* responder(nc, "req.many")
 
-      const replies = yield* Stream.runCollect(
-        nc.requestMany("req.many", "x", { maxMessages: 3, maxWait: "5 seconds" }),
-      )
+      const replies = yield* nc.requestMany("req.many", "x").pipe(Stream.take(3), Stream.runCollect)
 
       test.expect(replies.map((msg) => msg.string())).toEqual(["echo:x", "echo:x", "echo:x"])
     }).pipe(Effect.scoped, runtime.runPromise),
   )
 
-  test.it("requestMany stops after maxWait", () =>
+  test.it("requestMany collects for a duration with Stream.interruptWhen", () =>
     Effect.gen(function* () {
       const nc = yield* connect()
       for (let i = 0; i < 2; i++) yield* responder(nc, "req.wait")
 
-      const replies = yield* Stream.runCollect(
-        nc.requestMany("req.wait", "x", { maxWait: "300 millis" }),
-      )
+      const replies = yield* nc
+        .requestMany("req.wait", "x")
+        .pipe(Stream.interruptWhen(Effect.sleep("300 millis")), Stream.runCollect)
 
       test.expect(replies.length).toBe(2)
     }).pipe(Effect.scoped, runtime.runPromise),
   )
 
-  test.it("requestMany stops at a sentinel", () =>
+  test.it("requestMany stops when replies stall with Stream.timeout", () =>
+    Effect.gen(function* () {
+      const nc = yield* connect()
+      const sub = yield* nc.subscribe("req.stall")
+      yield* Effect.forkScoped(
+        Stream.runForEach(sub.messages, (msg) =>
+          Effect.all([
+            msg.respond("a"),
+            msg.respond("b"),
+            Effect.andThen(Effect.sleep("600 millis"), msg.respond("late")),
+          ]),
+        ),
+      )
+
+      const replies = yield* nc
+        .requestMany("req.stall", "x")
+        .pipe(Stream.timeout("200 millis"), Stream.runCollect)
+
+      test.expect(replies.map((msg) => msg.string())).toEqual(["a", "b"])
+    }).pipe(Effect.scoped, runtime.runPromise),
+  )
+
+  test.it("requestMany stops at a sentinel with Stream.takeWhile", () =>
     Effect.gen(function* () {
       const nc = yield* connect()
       const sub = yield* nc.subscribe("req.sentinel")
@@ -512,11 +547,32 @@ test.describe("request", () => {
         ),
       )
 
-      const replies = yield* Stream.runCollect(
-        nc.requestMany("req.sentinel", "x", { sentinel: true, maxWait: "5 seconds" }),
+      const replies = yield* nc.requestMany("req.sentinel", "x").pipe(
+        Stream.takeWhile((msg) => msg.data.length > 0),
+        Stream.runCollect,
       )
 
       test.expect(replies.map((msg) => msg.string())).toEqual(["a", "b"])
+    }).pipe(Effect.scoped, runtime.runPromise),
+  )
+
+  test.it("requestMany removes its reply subscription when the stream ends", () =>
+    Effect.gen(function* () {
+      const nc = yield* connect()
+      const sub = yield* nc.subscribe("req.cleanup")
+      const replySubject = yield* Deferred.make<string>()
+      yield* Effect.forkScoped(
+        Stream.runForEach(sub.messages, (msg) =>
+          Effect.andThen(Deferred.succeed(replySubject, msg.reply!), msg.respond("only")),
+        ),
+      )
+
+      yield* nc.requestMany("req.cleanup", "x").pipe(Stream.take(1), Stream.runDrain)
+      yield* nc.flush
+      // nobody listens on the reply subject anymore
+      const error = yield* Effect.flip(nc.request(yield* Deferred.await(replySubject)))
+
+      test.expect(error._tag).toBe("NatsNoRespondersError")
     }).pipe(Effect.scoped, runtime.runPromise),
   )
 
@@ -579,7 +635,7 @@ test.describe("websocket", () => {
       const payload = new Uint8Array(900 * 1024)
       for (let i = 0; i < payload.length; i++) payload[i] = i % 253
 
-      const reply = yield* nc.request("ws.echo", payload, { timeout: "5 seconds" })
+      const reply = yield* nc.request("ws.echo", payload).pipe(Effect.timeout("5 seconds"))
       const noResponders = yield* Effect.flip(nc.request("ws.nobody"))
 
       test.expect(reply.data).toEqual(payload)
@@ -669,7 +725,7 @@ test.describe("decentralized auth", () => {
   test.it("applies permissions from the user JWT", () =>
     Effect.gen(function* () {
       const nc = yield* connectOperator({ creds: limitedCreds })
-      const error = yield* Effect.flip(nc.request("forbidden.jwt", "x", { timeout: "5 seconds" }))
+      const error = yield* Effect.flip(nc.request("forbidden.jwt", "x"))
 
       test.expect(error._tag).toBe("NatsPermissionError")
     }).pipe(Effect.scoped, operatorRuntime.runPromise),
@@ -743,9 +799,7 @@ test.describe("lifecycle", () => {
       const sub = yield* nc.subscribe("life.close")
       yield* Effect.forkScoped(Stream.runDrain((yield* nc.subscribe("life.pending")).messages))
       const messages = yield* Effect.forkChild(Stream.runCollect(sub.messages))
-      const pending = yield* Effect.forkChild(
-        Effect.flip(nc.request("life.pending", "x", { timeout: "10 seconds" })),
-      )
+      const pending = yield* Effect.forkChild(Effect.flip(nc.request("life.pending", "x")))
       yield* nc.flush
 
       yield* nc.close
