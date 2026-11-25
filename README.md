@@ -2,12 +2,16 @@
 
 Native [NATS](https://nats.io) client for [Effect](https://effect.website).
 
+```sh
+bun add effect-nats effect
+```
+
 ## Usage
 
 ```ts
-import { NodeRuntime i} from "@effect/platform-node"
+import { NodeRuntime } from "@effect/platform-node"
+import { Console, Effect, Stream } from "effect"
 import { NatsConnection } from "effect-nats"
-import { Effect, Stream, Console } from "effect"
 
 const program = Effect.gen(function* () {
   const nc = yield* NatsConnection.NatsConnection
@@ -43,6 +47,6 @@ program.pipe(
 bun install
 # requires podman or docker. set NATS_SERVER_BIN to use local binary
 bun test
-bun check
+bun run typecheck
 bun lint
 ```

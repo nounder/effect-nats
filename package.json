@@ -1,7 +1,22 @@
 {
   "name": "effect-nats",
-  "version": "0.0.0",
+  "version": "0.1.0",
+  "description": "Native NATS client for Effect",
+  "keywords": [
+    "effect",
+    "messaging",
+    "nats",
+    "typescript"
+  ],
+  "homepage": "https://github.com/nounder/effect-nats#readme",
+  "bugs": {
+    "url": "https://github.com/nounder/effect-nats/issues"
+  },
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nounder/effect-nats.git"
+  },
   "files": [
     "src/",
     "dist/",
